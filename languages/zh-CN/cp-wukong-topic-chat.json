@@ -1,0 +1,21 @@
+{
+  "title": "悟空话题聊天室",
+  "openChat": "打开聊天室",
+  "close": "关闭",
+  "loading": "正在加载聊天室…",
+  "connecting": "正在连接…",
+  "connected": "已连接",
+  "disconnected": "连接已断开",
+  "offline": "你当前处于离线状态",
+  "retry": "重试",
+  "send": "发送",
+  "placeholder": "输入消息…",
+  "noMessages": "暂无消息",
+  "loginRequired": "请先登录后再使用聊天室。",
+  "permissionDenied": "你没有权限查看这个聊天室。",
+  "errorGeneric": "聊天室加载失败。",
+  "topicOnly": "此聊天室仅属于当前话题。",
+  "preparing": "正在准备话题聊天室…",
+  "messageFailed": "消息发送失败。",
+  "emptyInput": "请输入消息内容。"
+}
