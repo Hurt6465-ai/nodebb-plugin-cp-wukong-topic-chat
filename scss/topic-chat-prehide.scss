@@ -1,0 +1,26 @@
+body.cp-wk-prehide-enabled .topic .posts,
+body.cp-wk-prehide-enabled .topic .topic-main-buttons,
+body.cp-wk-prehide-enabled [component='post'] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+body.cp-wk-prehide-enabled.cp-wk-topic-chat-ready .topic .posts,
+body.cp-wk-prehide-enabled.cp-wk-topic-chat-ready .topic .topic-main-buttons,
+body.cp-wk-prehide-enabled.cp-wk-topic-chat-ready [component='post'] {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+body.cp-wk-prehide-enabled .cp-wukong-topic-chat-preloader {
+  display: flex;
+}
+
+.cp-wukong-topic-chat-preloader {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  padding: 1rem;
+  color: var(--bs-secondary-color, #6c757d);
+}
