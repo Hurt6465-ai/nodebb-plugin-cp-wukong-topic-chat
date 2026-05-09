@@ -575,17 +575,18 @@
       .catch(function (e) { warn("resolve-user", e); if (state.userCache[uid]) state.userCache[uid].loading = false; return state.userCache[uid]; });
   }
 
-  function getAvatarHtml(uid, username) {
-    uid = String(uid || "");
-    var u = getAjaxUserByUid(uid) || state.userCache[uid] || null;
+  function getAvatarHtml(uid, username, userOverride) {
+    uid = String(uid || (userOverride && userOverride.uid) || "");
+    var u = mergeDeep(mergeDeep({}, state.userCache[uid] || {}), userOverride || getAjaxUserByUid(uid) || {});
+    if (!u || !Object.keys(u).length) u = null;
     if (u) username = displayNameFromUser(u, username || (uid ? "用户" + uid : "用户"));
     var pic = (u && u.picture) || "";
     var text = (u && (u.icontext || u["icon:text"])) || String(username || uid || "?").charAt(0).toUpperCase();
     var bg = (u && (u.iconbgColor || u["icon:bgColor"])) || "#72a5f2";
     try {
       if (String(uid) === String(state.uid)) {
-        var me = getAjaxUserByUid(uid) || (window.app && app.user) || null;
-        if (me) {
+        var me = mergeDeep(mergeDeep({}, (window.app && app.user) || {}), getAjaxUserByUid(uid) || {});
+        if (me && Object.keys(me).length) {
           pic = me.picture || pic;
           text = me.icontext || me["icon:text"] || text;
           bg = me.iconbgColor || me["icon:bgColor"] || bg;
@@ -598,6 +599,25 @@
     var flagHtml = flag ? '<span class="cp-avatar-flag" aria-hidden="true">' + esc(flag) + '</span>' : '';
     var onlineHtml = userIsOnline(u) ? '<span class="cp-avatar-online" aria-label="在线"></span>' : '';
     return '<span class="cp-avatar-stack">' + core + flagHtml + onlineHtml + '</span>';
+  }
+
+  function getTopicHeaderUser() {
+    try {
+      var data = (window.ajaxify && ajaxify.data) || {};
+      var pools = [];
+      if (data.author) pools.push(data.author);
+      if (data.mainPost && data.mainPost.user) pools.push(data.mainPost.user);
+      if (data.topic && data.topic.user) pools.push(data.topic.user);
+      if (Array.isArray(data.posts) && data.posts[0] && data.posts[0].user) pools.push(data.posts[0].user);
+      if (data.loggedInUser) pools.push(data.loggedInUser);
+      var ownerUid = String((data.author && data.author.uid) || (data.mainPost && data.mainPost.uid) || (data.posts && data.posts[0] && data.posts[0].uid) || "");
+      for (var i = 0; i < pools.length; i++) {
+        var u = pools[i];
+        if (!u) continue;
+        if (!ownerUid || String(u.uid || "") === ownerUid) return u;
+      }
+    } catch (_) {}
+    return null;
   }
 
   function getUserProfileHref(uid, username) {
@@ -2016,7 +2036,10 @@
     var avatar = byId("cp-topic-avatar");
     if (title) title.textContent = state.topic ? state.topic.title : "话题聊天室";
     if (sub) sub.textContent = state.onlineCount > 0 ? ("在线 " + state.onlineCount + " 人") : "";
-    if (avatar) avatar.innerHTML = '<div class="avatar cp-avatar-fallback" style="background:#72a5f2">#</div>';
+    if (avatar) {
+      var headerUser = getTopicHeaderUser();
+      avatar.innerHTML = headerUser ? getAvatarHtml(headerUser.uid || "", displayNameFromUser(headerUser, "#"), headerUser) : '<div class="avatar cp-avatar-fallback" style="background:#72a5f2">#</div>';
+    }
   }
 
   function setStatus(text, lineText) {
@@ -2250,7 +2273,7 @@
       var m = normalizeMessageMedia(msgs[i]);
       var prev = msgs[i - 1];
       var next = msgs[i + 1];
-      if (!m.mine && (!m.username || /^用户\d+$/.test(m.username))) resolveUserMeta(m.uid);
+      if (!m.mine && m.uid) resolveUserMeta(m.uid);
       if (shouldShowTimeSep(prev, m)) html += '<div class="cp-time-sep"><span>' + formatTimeDivider(m.ts) + '</span></div>';
       var samePrev = !!(prev && prev.mine === m.mine && String(prev.uid || "") === String(m.uid || "") && Math.abs((m.ts || 0) - (prev.ts || 0)) < 2 * 60 * 1000 && formatDayLabel(prev.ts) === formatDayLabel(m.ts));
       var sameNext = !!(next && next.mine === m.mine && String(next.uid || "") === String(m.uid || "") && Math.abs((next.ts || 0) - (m.ts || 0)) < 2 * 60 * 1000 && formatDayLabel(next.ts) === formatDayLabel(m.ts));
