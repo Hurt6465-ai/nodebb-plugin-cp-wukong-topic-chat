@@ -1,7 +1,7 @@
 {
   "id": "nodebb-plugin-cp-wukong-topic-chat",
   "name": "CP Wukong Topic Chat",
-  "description": "Topic page chat shell for selected NodeBB categories with multilingual support.",
+  "description": "Topic page chat plugin for selected NodeBB categories with separated client JavaScript and SCSS.",
   "url": "https://github.com/Hurt56631-ai/nodebb-plugin-cp-wukong-topic-chat",
   "library": "./library.js",
   "languages": "languages",
@@ -10,9 +10,11 @@
     "public": "./public"
   },
   "templates": "./templates",
+  "scripts": [
+    "public/lib/topic-chat.js"
+  ],
   "scss": [
-    "scss/topic-chat-shell.scss",
-    "scss/topic-chat-prehide.scss"
+    "scss/topic-chat-ui.scss"
   ],
   "hooks": [
     {
