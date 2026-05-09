@@ -237,7 +237,7 @@ plugin.getConfig = async function getConfig(config) {
     categoryId: parseInteger(process.env.CP_WK_CATEGORY_ID || process.env.CP_WK_BOARD_ID, 7),
     localeFallback: process.env.CP_WK_LOCALE_FALLBACK || "en-GB",
     pluginId: "nodebb-plugin-cp-wukong-topic-chat",
-    userBatchUrl: "/bridge/nodebb-users",
+    userBatchUrl: "/nodebb-users",
     userCacheTtlMs: cacheTtlMs()
   };
 
