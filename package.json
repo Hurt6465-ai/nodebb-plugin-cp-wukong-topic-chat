@@ -1,0 +1,26 @@
+{
+  "name": "nodebb-plugin-cp-wukong-topic-chat",
+  "version": "0.1.0",
+  "description": "话题群聊",
+  "main": "library.js",
+  "license": "MIT",
+  "author": "CP",
+  "keywords": [
+    "nodebb",
+    "nodebb-plugin",
+    "wukongim",
+    "chat",
+    "topic"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.12.2",
+    "form-data": "^4.0.4",
+    "multer": "^2.0.2"
+  },
+  "nbbpm": {
+    "compatibility": ">=3.0.0"
+  }
+}
