@@ -445,15 +445,85 @@
     try { return (window.app && app.user && (app.user.displayname || app.user.fullname || app.user.username)) || state.username || "我"; } catch (_) { return state.username || "我"; }
   }
 
+  function normalizeUserField(u, keys) {
+    u = u || {};
+    for (var i = 0; i < keys.length; i++) {
+      if (u[keys[i]] !== undefined && u[keys[i]] !== null && u[keys[i]] !== "") return u[keys[i]];
+    }
+    return "";
+  }
+
+  function isEmojiFlag(v) {
+    return /^[\u{1F1E6}-\u{1F1FF}]{2}$/u.test(String(v || "").trim());
+  }
+
+  function flagEmojiFromUser(u) {
+    var raw = String(normalizeUserField(u, [
+      "language_flag", "languageFlag", "countryFlag", "country_flag",
+      "flag", "nationality", "country", "localeCountry"
+    ]) || "").trim();
+    if (!raw) return "";
+    if (isEmojiFlag(raw)) return raw;
+    var normalized = raw.toLowerCase().replace(/[\s_-]+/g, "");
+    var map = {
+      "缅甸": "🇲🇲", "缅甸语": "🇲🇲", "缅甸文": "🇲🇲", "မြန်မာ": "🇲🇲", "မြန်မာစာ": "🇲🇲", "myanmar": "🇲🇲", "burma": "🇲🇲", "burmese": "🇲🇲", "mm": "🇲🇲", "my": "🇲🇲",
+      "中国": "🇨🇳", "中文": "🇨🇳", "中国大陆": "🇨🇳", "china": "🇨🇳", "chinese": "🇨🇳", "cn": "🇨🇳", "zhcn": "🇨🇳",
+      "台湾": "🇹🇼", "繁体中文": "🇹🇼", "taiwan": "🇹🇼", "tw": "🇹🇼", "zhtw": "🇹🇼",
+      "香港": "🇭🇰", "hongkong": "🇭🇰", "hk": "🇭🇰",
+      "澳门": "🇲🇴", "macau": "🇲🇴", "mo": "🇲🇴",
+      "美国": "🇺🇸", "英语": "🇺🇸", "english": "🇺🇸", "usa": "🇺🇸", "us": "🇺🇸", "america": "🇺🇸", "unitedstates": "🇺🇸", "en": "🇺🇸",
+      "日本": "🇯🇵", "日语": "🇯🇵", "日本語": "🇯🇵", "japan": "🇯🇵", "japanese": "🇯🇵", "jp": "🇯🇵", "ja": "🇯🇵",
+      "韩国": "🇰🇷", "韩语": "🇰🇷", "한국어": "🇰🇷", "korea": "🇰🇷", "southkorea": "🇰🇷", "kr": "🇰🇷", "ko": "🇰🇷",
+      "泰国": "🇹🇭", "泰语": "🇹🇭", "ภาษาไทย": "🇹🇭", "thailand": "🇹🇭", "thai": "🇹🇭", "th": "🇹🇭",
+      "越南": "🇻🇳", "越南语": "🇻🇳", "tiếngviệt": "🇻🇳", "vietnam": "🇻🇳", "vietnamese": "🇻🇳", "vn": "🇻🇳", "vi": "🇻🇳",
+      "印度": "🇮🇳", "印地语": "🇮🇳", "हिन्दी": "🇮🇳", "india": "🇮🇳", "hindi": "🇮🇳", "in": "🇮🇳", "hi": "🇮🇳",
+      "俄罗斯": "🇷🇺", "俄语": "🇷🇺", "русский": "🇷🇺", "russia": "🇷🇺", "russian": "🇷🇺", "ru": "🇷🇺",
+      "法国": "🇫🇷", "法语": "🇫🇷", "français": "🇫🇷", "france": "🇫🇷", "french": "🇫🇷", "fr": "🇫🇷",
+      "德国": "🇩🇪", "德语": "🇩🇪", "deutsch": "🇩🇪", "germany": "🇩🇪", "german": "🇩🇪", "de": "🇩🇪",
+      "西班牙": "🇪🇸", "西语": "🇪🇸", "西班牙语": "🇪🇸", "español": "🇪🇸", "spain": "🇪🇸", "spanish": "🇪🇸", "es": "🇪🇸",
+      "马来西亚": "🇲🇾", "马来语": "🇲🇾", "malaysia": "🇲🇾", "malay": "🇲🇾", "ms": "🇲🇾", "myr": "🇲🇾",
+      "新加坡": "🇸🇬", "singapore": "🇸🇬", "sg": "🇸🇬",
+      "柬埔寨": "🇰🇭", "高棉语": "🇰🇭", "cambodia": "🇰🇭", "khmer": "🇰🇭", "kh": "🇰🇭",
+      "老挝": "🇱🇦", "老挝语": "🇱🇦", "laos": "🇱🇦", "lao": "🇱🇦", "lo": "🇱🇦",
+      "菲律宾": "🇵🇭", "菲律宾语": "🇵🇭", "philippines": "🇵🇭", "filipino": "🇵🇭", "tagalog": "🇵🇭", "ph": "🇵🇭",
+      "印尼": "🇮🇩", "印度尼西亚": "🇮🇩", "印尼语": "🇮🇩", "indonesia": "🇮🇩", "indonesian": "🇮🇩", "id": "🇮🇩"
+    };
+    return map[raw] || map[normalized] || "";
+  }
+
+  function userIsOnline(u) {
+    if (!u) return false;
+    var status = String(normalizeUserField(u, ["status", "userStatus", "presence", "onlineStatus"]) || "").toLowerCase();
+    if (status === "online") return true;
+    if (status === "offline" || status === "invisible") return false;
+    if (u.online === true || u.isOnline === true) return true;
+    return false;
+  }
+
+  function buildUserCacheEntry(uid, u) {
+    u = u || {};
+    return {
+      loaded: true,
+      uid: String(uid || u.uid || ""),
+      username: displayNameFromUser(u, uid ? "用户" + uid : "用户"),
+      picture: u.picture || "",
+      icontext: u.icontext || u["icon:text"] || "",
+      iconbgColor: u.iconbgColor || u["icon:bgColor"] || "#72a5f2",
+      userslug: u.userslug || u.slug || u.username || "",
+      status: normalizeUserField(u, ["status", "userStatus", "presence", "onlineStatus"]),
+      online: userIsOnline(u),
+      language_flag: normalizeUserField(u, ["language_flag", "languageFlag", "countryFlag", "country_flag", "flag", "nationality", "country", "localeCountry"])
+    };
+  }
 
   function getAjaxUserByUid(uid) {
     uid = String(uid || "");
     try {
-      if (String(uid) === String(state.uid) && window.app && app.user) {
-        return { uid: uid, username: app.user.username || state.username || "我", displayname: app.user.displayname || app.user.fullname || app.user.username || state.username || "我", picture: app.user.picture || "", icontext: app.user.icontext || "", iconbgColor: app.user.iconbgColor || "#72a5f2" };
-      }
       if (window.ajaxify && ajaxify.data) {
         var pools = [];
+        if (ajaxify.data.loggedInUser) pools.push(ajaxify.data.loggedInUser);
+        if (ajaxify.data.author) pools.push(ajaxify.data.author);
+        if (ajaxify.data.mainPost && ajaxify.data.mainPost.user) pools.push(ajaxify.data.mainPost.user);
         if (Array.isArray(ajaxify.data.users)) pools = pools.concat(ajaxify.data.users);
         if (ajaxify.data.postData && Array.isArray(ajaxify.data.postData.users)) pools = pools.concat(ajaxify.data.postData.users);
         if (ajaxify.data.posts && Array.isArray(ajaxify.data.posts)) {
@@ -463,6 +533,9 @@
           var u = pools[i];
           if (u && String(u.uid) === uid) return u;
         }
+      }
+      if (String(uid) === String(state.uid) && window.app && app.user) {
+        return app.user;
       }
     } catch (_) {}
     return null;
@@ -479,15 +552,7 @@
     if (state.userCache[uid] && state.userCache[uid].loaded) return Promise.resolve(state.userCache[uid]);
     var local = getAjaxUserByUid(uid);
     if (local) {
-      state.userCache[uid] = mergeDeep(state.userCache[uid] || {}, {
-        loaded: true,
-        uid: uid,
-        username: displayNameFromUser(local, "用户" + uid),
-        picture: local.picture || "",
-        icontext: local.icontext || "",
-        iconbgColor: local.iconbgColor || "#72a5f2",
-        userslug: local.userslug || local.slug || local.username || ""
-      });
+      state.userCache[uid] = mergeDeep(state.userCache[uid] || {}, buildUserCacheEntry(uid, local));
       return Promise.resolve(state.userCache[uid]);
     }
     if (state.userCache[uid] && state.userCache[uid].loading) return Promise.resolve(state.userCache[uid]);
@@ -496,15 +561,7 @@
     return fetch("/bridge/nodebb-user/" + encodeURIComponent(uid), { credentials: "include" })
       .then(function (r) { if (!r.ok) throw new Error("user profile " + r.status); return r.json(); })
       .then(function (u) {
-        state.userCache[uid] = {
-          loaded: true,
-          uid: uid,
-          username: displayNameFromUser(u, "用户" + uid),
-          picture: u.picture || "",
-          icontext: u.icontext || "",
-          iconbgColor: u.iconbgColor || "#72a5f2",
-          userslug: u.userslug || u.slug || u.username || ""
-        };
+        state.userCache[uid] = buildUserCacheEntry(uid, u);
         state.messages.forEach(function (m) {
           if (String(m.uid) === uid && !m.mine) {
             m.username = state.userCache[uid].username;
@@ -523,17 +580,24 @@
     var u = getAjaxUserByUid(uid) || state.userCache[uid] || null;
     if (u) username = displayNameFromUser(u, username || (uid ? "用户" + uid : "用户"));
     var pic = (u && u.picture) || "";
-    var text = (u && u.icontext) || String(username || uid || "?").charAt(0).toUpperCase();
-    var bg = (u && u.iconbgColor) || "#72a5f2";
+    var text = (u && (u.icontext || u["icon:text"])) || String(username || uid || "?").charAt(0).toUpperCase();
+    var bg = (u && (u.iconbgColor || u["icon:bgColor"])) || "#72a5f2";
     try {
-      if (String(uid) === String(state.uid) && window.app && app.user) {
-        pic = app.user.picture || pic;
-        text = app.user.icontext || text;
-        bg = app.user.iconbgColor || bg;
+      if (String(uid) === String(state.uid)) {
+        var me = getAjaxUserByUid(uid) || (window.app && app.user) || null;
+        if (me) {
+          pic = me.picture || pic;
+          text = me.icontext || me["icon:text"] || text;
+          bg = me.iconbgColor || me["icon:bgColor"] || bg;
+          u = mergeDeep(mergeDeep({}, u || {}), me);
+        }
       }
     } catch (_) {}
-    if (pic) return '<img class="avatar" src="' + escAttr(pic) + '" />';
-    return '<div class="avatar cp-avatar-fallback" style="background:' + escAttr(bg) + '">' + esc(text) + '</div>';
+    var core = pic ? '<img class="avatar" src="' + escAttr(pic) + '" />' : '<div class="avatar cp-avatar-fallback" style="background:' + escAttr(bg) + '">' + esc(text) + '</div>';
+    var flag = flagEmojiFromUser(u);
+    var flagHtml = flag ? '<span class="cp-avatar-flag" aria-hidden="true">' + esc(flag) + '</span>' : '';
+    var onlineHtml = userIsOnline(u) ? '<span class="cp-avatar-online" aria-label="在线"></span>' : '';
+    return '<span class="cp-avatar-stack">' + core + flagHtml + onlineHtml + '</span>';
   }
 
   function getUserProfileHref(uid, username) {
