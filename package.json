@@ -1,26 +1,39 @@
 {
   "name": "nodebb-plugin-cp-wukong-topic-chat",
   "version": "0.1.0",
-  "description": "话题群聊",
+  "description": "话题式群聊",
   "main": "library.js",
-  "license": "MIT",
-  "author": "CP",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hurt56631-ai/nodebb-plugin-cp-wukong-topic-chat.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Hurt56631-ai/nodebb-plugin-cp-wukong-topic-chat/issues"
+  },
+  "homepage": "https://github.com/Hurt56631-ai/nodebb-plugin-cp-wukong-topic-chat#readme",
   "keywords": [
     "nodebb",
     "nodebb-plugin",
-    "wukongim",
+    "topic",
     "chat",
-    "topic"
+    "wukong",
+    "cp"
   ],
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "axios": "^1.12.2",
-    "form-data": "^4.0.4",
-    "multer": "^2.0.2"
-  },
   "nbbpm": {
-    "compatibility": ">=3.0.0"
-  }
+    "compatibility": "^3.0.0 || ^4.0.0"
+  },
+  "files": [
+    "library.js",
+    "plugin.json",
+    "README.md",
+    "scss",
+    "templates",
+    "languages",
+    "static",
+    "public"
+  ]
 }
