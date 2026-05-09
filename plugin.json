@@ -11,7 +11,8 @@
   },
   "templates": "./templates",
   "scripts": [
-    "public/lib/topic-chat.js"
+    "public/lib/topic-chat.js",
+    "public/lib/category-activity-sort.js"
   ],
   "scss": [
     "scss/topic-chat-ui.scss"
