@@ -1,0 +1,15 @@
+{
+  "id": "nodebb-plugin-cp-wukong-topic-chat",
+  "url": "https://example.com/nodebb-plugin-cp-wukong-topic-chat",
+  "library": "./library.js",
+  "hooks": [
+    { "hook": "static:app.load", "method": "init" }
+  ],
+  "staticDirs": {
+    "static": "./static"
+  },
+  "scss": [
+    "scss/topic-chat-prehide.scss",
+    "scss/topic-chat-shell.scss"
+  ]
+}
