@@ -38,6 +38,16 @@ npm install ./nodebb-plugin-cp-wukong-topic-chat
 ./nodebb build
 ./nodebb restart
 ```
+## termius安装
+```bash
+docker update --restart=no nodebb
+
+docker exec -it nodebb sh -lc 'cd /usr/src/app && npm install --legacy-peer-deps --force https://github.com/Hurt6465-ai/nodebb-plugin-cp-wukong-topic-chat/archive/refs/heads/main.tar.gz && ./nodebb build'
+
+docker restart nodebb
+
+docker update --restart=always nodebb
+```
 
 ## 环境变量
 
