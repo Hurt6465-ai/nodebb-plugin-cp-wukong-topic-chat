@@ -31,7 +31,7 @@
     notifyUrl: "/bridge/topic-notify",
     notifyListUrl: "/bridge/topic-notify/list",
     notifyDoneUrl: "/bridge/topic-notify/done",
-    usersBatchUrl: "/bridge/nodebb-users",
+    usersBatchUrl: "/nodebb-users",
     userCacheTtlMs: 30 * 24 * 3600 * 1000,
     debug: false
   };
@@ -682,11 +682,13 @@
     pending.forEach(function (uid) { delete state.userBatchPending[uid]; });
     if (!pending.length) return;
     var cfg = (window.config && window.config.cpWukongTopicChat) || {};
-    var batchUrl = String(cfg.userBatchUrl || CONFIG.usersBatchUrl || "/bridge/nodebb-users");
+    var batchUrl = String(cfg.userBatchUrl || CONFIG.usersBatchUrl || "/nodebb-users");
     try {
       var res = await fetch(batchUrl + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
       if (!res.ok && batchUrl.indexOf("/bridge/") === 0) {
         res = await fetch(batchUrl.replace(/^\/bridge/, "") + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
+      } else if (!res.ok && batchUrl.indexOf("/nodebb-users") === 0) {
+        res = await fetch("/bridge" + batchUrl + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
       }
       if (!res.ok) throw new Error("batch user profile " + res.status);
       var data = await res.json();
@@ -698,7 +700,7 @@
       warn("resolve-users-batch", e);
       // 批量接口不可用时，只兜底请求少量单用户接口，避免一次性打爆服务器。
       pending.slice(0, 5).forEach(function (uid) {
-        fetch("/bridge/nodebb-user/" + encodeURIComponent(uid), { credentials: "include" })
+        fetch("/nodebb-user/" + encodeURIComponent(uid), { credentials: "include" })
           .then(function (r) { if (!r.ok) throw new Error("user profile " + r.status); return r.json(); })
           .then(function (u) { applyResolvedUser(uid, u); saveUserCacheLocalSoon(); queueRender("keep"); })
           .catch(function (err) { warn("resolve-user-fallback", err); });
