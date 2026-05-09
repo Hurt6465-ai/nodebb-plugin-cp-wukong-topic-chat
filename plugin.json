@@ -15,6 +15,7 @@
     "public/lib/category-activity-sort.js"
   ],
   "scss": [
+    "scss/topic-chat-prehide.scss",
     "scss/topic-chat-ui.scss"
   ],
   "hooks": [
