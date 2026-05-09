@@ -24,3 +24,28 @@ body.cp-wk-prehide-enabled .cp-wukong-topic-chat-preloader {
   padding: 1rem;
   color: var(--bs-secondary-color, #6c757d);
 }
+
+/* CP Wukong topic chat prehide.
+ * This CSS is compiled by NodeBB before the frontend JS runs, so category 7 topic
+ * pages no longer flash the original post UI before the chat shell mounts.
+ * Safety: if the chat JS does not mount, the original topic UI is shown again after 1.6s.
+ */
+
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-on-v20) .topic {
+  opacity: 0;
+  pointer-events: none;
+  animation: cp-topic-chat-prehide-fallback 0s linear 1.6s forwards;
+}
+
+body.page-topic.page-topic-category-7.cp-topic-chat-on-v20 .topic {
+  opacity: 1;
+  pointer-events: auto;
+  animation: none;
+}
+
+@keyframes cp-topic-chat-prehide-fallback {
+  to {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
