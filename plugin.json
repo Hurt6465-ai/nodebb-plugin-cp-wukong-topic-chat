@@ -1,15 +1,27 @@
 {
   "id": "nodebb-plugin-cp-wukong-topic-chat",
-  "url": "https://example.com/nodebb-plugin-cp-wukong-topic-chat",
+  "name": "CP Wukong Topic Chat",
+  "description": "Topic page chat shell for selected NodeBB categories with multilingual support.",
+  "url": "https://github.com/Hurt56631-ai/nodebb-plugin-cp-wukong-topic-chat",
   "library": "./library.js",
-  "hooks": [
-    { "hook": "static:app.load", "method": "init" }
-  ],
+  "languages": "languages",
   "staticDirs": {
-    "static": "./static"
+    "static": "./static",
+    "public": "./public"
   },
+  "templates": "./templates",
   "scss": [
-    "scss/topic-chat-prehide.scss",
-    "scss/topic-chat-shell.scss"
+    "scss/topic-chat-shell.scss",
+    "scss/topic-chat-prehide.scss"
+  ],
+  "hooks": [
+    {
+      "hook": "static:app.load",
+      "method": "init"
+    },
+    {
+      "hook": "filter:config.get",
+      "method": "getConfig"
+    }
   ]
 }
