@@ -685,6 +685,9 @@
     var batchUrl = String(cfg.userBatchUrl || CONFIG.usersBatchUrl || "/bridge/nodebb-users");
     try {
       var res = await fetch(batchUrl + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
+      if (!res.ok && batchUrl.indexOf("/bridge/") === 0) {
+        res = await fetch(batchUrl.replace(/^\/bridge/, "") + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
+      }
       if (!res.ok) throw new Error("batch user profile " + res.status);
       var data = await res.json();
       var users = Array.isArray(data && data.users) ? data.users : [];
@@ -2148,7 +2151,11 @@
     var avatar = byId("cp-topic-avatar");
     if (title) title.textContent = state.topic ? state.topic.title : "话题聊天室";
     if (sub) sub.textContent = state.onlineCount > 0 ? ("在线 " + state.onlineCount + " 人") : "";
-    if (avatar) avatar.innerHTML = '<div class="avatar cp-avatar-fallback" style="background:#72a5f2">#</div>';
+    if (avatar) {
+      avatar.innerHTML = '<span class="cp-topic-hash-avatar" aria-hidden="true">#</span>';
+      avatar.classList.add("cp-peer-avatar-hash");
+      avatar.removeAttribute("href");
+    }
   }
 
   function setStatus(text, lineText) {
