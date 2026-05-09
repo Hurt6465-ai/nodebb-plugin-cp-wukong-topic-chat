@@ -1,0 +1,21 @@
+{
+  "title": "Wukong Topic Chat",
+  "openChat": "Open chat",
+  "close": "Close",
+  "loading": "Loading chat…",
+  "connecting": "Connecting…",
+  "connected": "Connected",
+  "disconnected": "Disconnected",
+  "offline": "You are offline",
+  "retry": "Retry",
+  "send": "Send",
+  "placeholder": "Write a message…",
+  "noMessages": "No messages yet",
+  "loginRequired": "Please log in to use the chat.",
+  "permissionDenied": "You do not have permission to view this chat.",
+  "errorGeneric": "Unable to load the chat.",
+  "topicOnly": "This chat belongs to the current topic only.",
+  "preparing": "Preparing topic chat…",
+  "messageFailed": "Message failed to send.",
+  "emptyInput": "Please enter a message."
+}
