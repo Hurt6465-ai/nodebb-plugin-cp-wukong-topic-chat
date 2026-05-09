@@ -1,28 +1,55 @@
 'use strict';
 
-const winston = require.main.require('winston');
-
-const settings = require('./lib/settings');
-const prehide = require('./lib/prehide');
-const routes = require('./lib/routes');
-
 const plugin = {};
 
-plugin.init = async function init(params) {
-  const { router, middleware } = params;
-
-  const getConfig = async () => settings.get();
-  const cfg = await getConfig();
-
-  if (!cfg.enabled) {
-    winston.info('[cp-wukong-topic-chat] plugin loaded but disabled by CP_WK_ENABLED=0');
-    return;
+function parseBoolean(value, defaultValue) {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
   }
 
-  prehide.install(router, getConfig, winston);
-  routes.install(router, middleware, getConfig, winston);
+  const normalized = String(value).trim().toLowerCase();
 
-  winston.info(`[cp-wukong-topic-chat] ready: targetCid=${cfg.targetCid}, channelType=${cfg.channelType}, prehide=${cfg.enablePrehide}`);
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) {
+    return false;
+  }
+
+  return defaultValue;
+}
+
+function parseInteger(value, defaultValue) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : defaultValue;
+}
+
+plugin.init = async function init(params) {
+  const router = params.router;
+  const middleware = params.middleware;
+
+  router.get('/cp-wukong-topic-chat/health', middleware.applyCSRF, async (req, res) => {
+    res.json({
+      ok: true,
+      plugin: 'nodebb-plugin-cp-wukong-topic-chat',
+      enabled: parseBoolean(process.env.CP_WK_TOPIC_CHAT_ENABLED, true),
+      prehide: parseBoolean(process.env.CP_WK_PREHIDE, false),
+      categoryId: parseInteger(process.env.CP_WK_CATEGORY_ID || process.env.CP_WK_BOARD_ID, 7)
+    });
+  });
+};
+
+plugin.getConfig = async function getConfig(config) {
+  config.cpWukongTopicChat = {
+    enabled: parseBoolean(process.env.CP_WK_TOPIC_CHAT_ENABLED, true),
+    prehide: parseBoolean(process.env.CP_WK_PREHIDE, false),
+    categoryId: parseInteger(process.env.CP_WK_CATEGORY_ID || process.env.CP_WK_BOARD_ID, 7),
+    localeFallback: process.env.CP_WK_LOCALE_FALLBACK || 'en-GB',
+    pluginId: 'nodebb-plugin-cp-wukong-topic-chat'
+  };
+
+  return config;
 };
 
 module.exports = plugin;
