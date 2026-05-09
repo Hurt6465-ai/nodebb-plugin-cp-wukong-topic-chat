@@ -3,10 +3,16 @@
 const plugin = {};
 
 let User;
+let db;
 try {
   User = require.main.require("./src/user");
 } catch (err) {
   User = null;
+}
+try {
+  db = require.main.require("./src/database");
+} catch (err) {
+  db = null;
 }
 
 const USER_PROFILE_FIELDS = [
@@ -100,35 +106,79 @@ function cacheSet(uid, user) {
   });
 }
 
+async function loadUserRawFields(uid) {
+  uid = parseInteger(uid, 0);
+  if (!uid) return null;
+
+  let out = null;
+
+  if (User && typeof User.getUserFields === "function") {
+    try {
+      out = await User.getUserFields(uid, USER_PROFILE_FIELDS);
+    } catch (err) {
+      out = null;
+    }
+  }
+
+  // Some custom profile fields can be present directly in user:<uid> even when
+  // they are not exposed by normal user helpers. Read only the small public
+  // whitelist above; never return private fields such as email/location/birthday.
+  if (db && typeof db.getObjectFields === "function") {
+    try {
+      const direct = await db.getObjectFields(`user:${uid}`, USER_PROFILE_FIELDS);
+      out = Object.assign({}, out || {}, direct || {});
+    } catch (err) {}
+  }
+
+  if (!out) return null;
+  out.uid = out.uid || uid;
+  return out;
+}
+
 async function getUsersPublicProfiles(uids) {
-  const uniqueUids = normalizeUidList(uids.join ? uids.join(",") : uids);
+  const uniqueUids = normalizeUidList(uids && uids.join ? uids.join(",") : uids);
   if (!uniqueUids.length) return [];
 
-  const cached = [];
+  const resultByUid = new Map();
   const missing = [];
+
   uniqueUids.forEach((uid) => {
     const hit = cacheGet(uid);
-    if (hit) cached.push(hit);
+    if (hit) resultByUid.set(String(uid), hit);
     else missing.push(uid);
   });
 
   let loaded = [];
-  if (missing.length && User) {
-    if (typeof User.getUsersFields === "function") {
-      const users = await User.getUsersFields(missing, USER_PROFILE_FIELDS);
-      loaded = Array.isArray(users) ? users.map(pickPublicUserFields) : [];
-    } else if (typeof User.getUserFields === "function") {
-      loaded = await Promise.all(missing.map(async (uid) => pickPublicUserFields(await User.getUserFields(uid, USER_PROFILE_FIELDS))));
+
+  if (missing.length) {
+    // Prefer the bulk helper when it exists, then merge with direct db reads so
+    // custom fields like language_flag are not silently dropped.
+    if (User && typeof User.getUsersFields === "function") {
+      try {
+        const bulk = await User.getUsersFields(missing, USER_PROFILE_FIELDS);
+        if (Array.isArray(bulk)) loaded = bulk;
+      } catch (err) {
+        loaded = [];
+      }
     }
-    loaded.forEach((u) => cacheSet(u.uid, u));
+
+    const loadedByUid = new Map();
+    loaded.forEach((u) => {
+      if (u && u.uid) loadedByUid.set(String(u.uid), u);
+    });
+
+    await Promise.all(missing.map(async (uid) => {
+      const direct = await loadUserRawFields(uid);
+      const merged = Object.assign({}, loadedByUid.get(String(uid)) || {}, direct || {}, { uid });
+      const publicUser = pickPublicUserFields(merged);
+      if (publicUser && publicUser.uid) {
+        cacheSet(publicUser.uid, publicUser);
+        resultByUid.set(String(publicUser.uid), publicUser);
+      }
+    }));
   }
 
-  const byUid = new Map();
-  cached.concat(loaded).forEach((u) => {
-    if (u && u.uid) byUid.set(String(u.uid), u);
-  });
-
-  return uniqueUids.map((uid) => byUid.get(String(uid))).filter(Boolean);
+  return uniqueUids.map((uid) => resultByUid.get(String(uid))).filter(Boolean);
 }
 
 plugin.init = async function init(params) {
@@ -149,18 +199,18 @@ plugin.init = async function init(params) {
     });
   });
 
-  router.get("/bridge/nodebb-users", async (req, res) => {
+  const handleUsersBatch = async (req, res) => {
     try {
       const uids = normalizeUidList(req.query && req.query.uids);
-      if (!uids.length) return res.json({ users: [] });
+      if (!uids.length) return res.json({ users: [], cacheTtlMs: cacheTtlMs() });
       const users = await getUsersPublicProfiles(uids);
       res.json({ users, cacheTtlMs: cacheTtlMs() });
     } catch (err) {
       res.status(500).json({ error: "nodebb_users_failed", message: String((err && err.message) || err) });
     }
-  });
+  };
 
-  router.get("/bridge/nodebb-user/:uid", async (req, res) => {
+  const handleSingleUser = async (req, res) => {
     try {
       const uid = parseInteger(req.params && req.params.uid, 0);
       if (!uid) return res.status(400).json({ error: "invalid_uid" });
@@ -169,7 +219,16 @@ plugin.init = async function init(params) {
     } catch (err) {
       res.status(500).json({ error: "nodebb_user_failed", message: String((err && err.message) || err) });
     }
-  });
+  };
+
+  // Main bridge routes used by the chat frontend.
+  router.get("/bridge/nodebb-users", handleUsersBatch);
+  router.get("/bridge/nodebb-user/:uid", handleSingleUser);
+
+  // Alias routes for quick browser testing. These also prevent confusion when
+  // opening /nodebb-users?uids=14 directly.
+  router.get("/nodebb-users", handleUsersBatch);
+  router.get("/nodebb-user/:uid", handleSingleUser);
 };
 
 plugin.getConfig = async function getConfig(config) {
