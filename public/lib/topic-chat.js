@@ -31,6 +31,8 @@
     notifyUrl: "/bridge/topic-notify",
     notifyListUrl: "/bridge/topic-notify/list",
     notifyDoneUrl: "/bridge/topic-notify/done",
+    usersBatchUrl: "/bridge/nodebb-users",
+    userCacheTtlMs: 30 * 24 * 3600 * 1000,
     debug: false
   };
 
@@ -129,6 +131,11 @@
   var KEY_BG = "cp_topic_wk_bg_v20";
   var DEFAULT_BG = { dataUrl: "", opacity: 0.08, blur: 0 };
   var KEY_PENDING_NOTICE = "cp_topic_pending_notice_v25";
+  var KEY_USER_CACHE = "cp_topic_wk_user_cache_v30";
+  var USER_CACHE_TTL = CONFIG.userCacheTtlMs || (30 * 24 * 3600 * 1000);
+  var USER_CACHE_MAX = 500;
+  var USER_BATCH_MAX = 50;
+  var userCacheTimer = null;
 
   var state = {
     mounted: false,
@@ -178,6 +185,8 @@
     contextMsg: null,
     quoteTarget: null,
     userCache: {},
+    userBatchPending: {},
+    userBatchTimer: null,
     blobUrlCache: {},
     blobKeys: [],
     encodeSupport: {},
@@ -445,6 +454,69 @@
     try { return (window.app && app.user && (app.user.displayname || app.user.fullname || app.user.username)) || state.username || "我"; } catch (_) { return state.username || "我"; }
   }
 
+  function getConfigUserCacheTtl() {
+    try {
+      var cfg = window.config && window.config.cpWukongTopicChat;
+      var ttl = Number((cfg && cfg.userCacheTtlMs) || USER_CACHE_TTL || 0);
+      return ttl > 60000 ? ttl : (30 * 24 * 3600 * 1000);
+    } catch (_) {
+      return 30 * 24 * 3600 * 1000;
+    }
+  }
+
+  function pruneUserCache() {
+    var nowTs = Date.now();
+    var keys = Object.keys(state.userCache || {});
+    keys.forEach(function (uid) {
+      var u = state.userCache[uid];
+      if (!u || (u.cacheExpiresAt && Number(u.cacheExpiresAt) < nowTs)) delete state.userCache[uid];
+    });
+    keys = Object.keys(state.userCache || {});
+    if (keys.length <= USER_CACHE_MAX) return;
+    keys.sort(function (a, b) {
+      return Number((state.userCache[a] && state.userCache[a].cacheAt) || 0) - Number((state.userCache[b] && state.userCache[b].cacheAt) || 0);
+    });
+    keys.slice(0, keys.length - USER_CACHE_MAX).forEach(function (uid) { delete state.userCache[uid]; });
+  }
+
+  function loadUserCacheLocal() {
+    try {
+      var raw = localStorage.getItem(KEY_USER_CACHE);
+      if (!raw) return;
+      var data = JSON.parse(raw);
+      if (!data || !data.users) return;
+      var nowTs = Date.now();
+      Object.keys(data.users).forEach(function (uid) {
+        var u = data.users[uid];
+        if (!u || (u.cacheExpiresAt && Number(u.cacheExpiresAt) < nowTs)) return;
+        state.userCache[String(uid)] = u;
+      });
+      pruneUserCache();
+    } catch (e) { warn("load-user-cache", e); }
+  }
+
+  function saveUserCacheLocalSoon() {
+    clearTimeout(userCacheTimer);
+    userCacheTimer = setTimeout(function () {
+      try {
+        pruneUserCache();
+        localStorage.setItem(KEY_USER_CACHE, JSON.stringify({ version: 30, ts: Date.now(), users: state.userCache || {} }));
+      } catch (e) { warn("save-user-cache", e); }
+    }, 600);
+  }
+
+  function collectMessageUids(list) {
+    var out = [];
+    var seen = {};
+    (list || []).forEach(function (m) {
+      var uid = String(m && m.uid || "").trim();
+      if (uid && !m.mine && !seen[uid]) { seen[uid] = true; out.push(uid); }
+      var qUid = String(m && m.quoteUid || "").trim();
+      if (qUid && !seen[qUid]) { seen[qUid] = true; out.push(qUid); }
+    });
+    return out;
+  }
+
   function normalizeUserField(u, keys) {
     u = u || {};
     for (var i = 0; i < keys.length; i++) {
@@ -502,17 +574,22 @@
 
   function buildUserCacheEntry(uid, u) {
     u = u || {};
+    var nowTs = Date.now();
+    var id = String(uid || u.uid || "");
     return {
       loaded: true,
-      uid: String(uid || u.uid || ""),
-      username: displayNameFromUser(u, uid ? "用户" + uid : "用户"),
-      picture: u.picture || "",
+      uid: id,
+      username: u.username || displayNameFromUser(u, id ? "用户" + id : "用户"),
+      displayname: displayNameFromUser(u, id ? "用户" + id : "用户"),
+      picture: u.picture || u.uploadedpicture || "",
       icontext: u.icontext || u["icon:text"] || "",
       iconbgColor: u.iconbgColor || u["icon:bgColor"] || "#72a5f2",
       userslug: u.userslug || u.slug || u.username || "",
       status: normalizeUserField(u, ["status", "userStatus", "presence", "onlineStatus"]),
       online: userIsOnline(u),
-      language_flag: normalizeUserField(u, ["language_flag", "languageFlag", "countryFlag", "country_flag", "flag", "nationality", "country", "localeCountry"])
+      language_flag: normalizeUserField(u, ["language_flag", "languageFlag", "countryFlag", "country_flag", "flag", "nationality", "country", "localeCountry"]),
+      cacheAt: nowTs,
+      cacheExpiresAt: nowTs + getConfigUserCacheTtl()
     };
   }
 
@@ -549,44 +626,98 @@
   function resolveUserMeta(uid) {
     uid = String(uid || "");
     if (!uid) return Promise.resolve(null);
-    if (state.userCache[uid] && state.userCache[uid].loaded) return Promise.resolve(state.userCache[uid]);
     var local = getAjaxUserByUid(uid);
     if (local) {
       state.userCache[uid] = mergeDeep(state.userCache[uid] || {}, buildUserCacheEntry(uid, local));
+      saveUserCacheLocalSoon();
       return Promise.resolve(state.userCache[uid]);
     }
-    if (state.userCache[uid] && state.userCache[uid].loading) return Promise.resolve(state.userCache[uid]);
-    state.userCache[uid] = state.userCache[uid] || { uid: uid, username: "用户" + uid, loaded: false };
-    state.userCache[uid].loading = true;
-    return fetch("/bridge/nodebb-user/" + encodeURIComponent(uid), { credentials: "include" })
-      .then(function (r) { if (!r.ok) throw new Error("user profile " + r.status); return r.json(); })
-      .then(function (u) {
-        state.userCache[uid] = buildUserCacheEntry(uid, u);
-        state.messages.forEach(function (m) {
-          if (String(m.uid) === uid && !m.mine) {
-            m.username = state.userCache[uid].username;
-            m.avatarHtml = getAvatarHtml(uid, m.username);
-          }
-        });
-        queueRender("keep");
-        saveCacheSoon();
-        return state.userCache[uid];
-      })
-      .catch(function (e) { warn("resolve-user", e); if (state.userCache[uid]) state.userCache[uid].loading = false; return state.userCache[uid]; });
+    if (state.userCache[uid] && state.userCache[uid].loaded && (!state.userCache[uid].cacheExpiresAt || Number(state.userCache[uid].cacheExpiresAt) > Date.now())) {
+      return Promise.resolve(state.userCache[uid]);
+    }
+    queueResolveUsers([uid]);
+    return Promise.resolve(state.userCache[uid] || { uid: uid, username: "用户" + uid, loaded: false, loading: true });
   }
 
-  function getAvatarHtml(uid, username, userOverride) {
-    uid = String(uid || (userOverride && userOverride.uid) || "");
-    var u = mergeDeep(mergeDeep({}, state.userCache[uid] || {}), userOverride || getAjaxUserByUid(uid) || {});
-    if (!u || !Object.keys(u).length) u = null;
+  function applyResolvedUser(uid, user) {
+    uid = String(uid || (user && user.uid) || "");
+    if (!uid || !user) return;
+    state.userCache[uid] = mergeDeep(state.userCache[uid] || {}, buildUserCacheEntry(uid, user));
+    state.messages.forEach(function (m) {
+      if (String(m.uid || "") === uid && !m.mine) {
+        m.username = state.userCache[uid].displayname || state.userCache[uid].username || m.username;
+        m.avatarHtml = getAvatarHtml(uid, m.username);
+      }
+    });
+  }
+
+  function queueResolveUsers(uids) {
+    uids = Array.isArray(uids) ? uids : [uids];
+    var added = false;
+    uids.forEach(function (uid) {
+      uid = String(uid || "").trim();
+      if (!uid) return;
+      var local = getAjaxUserByUid(uid);
+      if (local) {
+        applyResolvedUser(uid, local);
+        added = true;
+        return;
+      }
+      var cached = state.userCache[uid];
+      if (cached && cached.loaded && (!cached.cacheExpiresAt || Number(cached.cacheExpiresAt) > Date.now())) return;
+      state.userBatchPending[uid] = true;
+      added = true;
+    });
+    if (!added) return;
+    clearTimeout(state.userBatchTimer);
+    state.userBatchTimer = setTimeout(fetchPendingUsersBatch, 180);
+  }
+
+  function queueResolveUsersFromMessages(list) {
+    queueResolveUsers(collectMessageUids(list || state.messages || []));
+  }
+
+  async function fetchPendingUsersBatch() {
+    var pending = Object.keys(state.userBatchPending || {}).slice(0, USER_BATCH_MAX);
+    pending.forEach(function (uid) { delete state.userBatchPending[uid]; });
+    if (!pending.length) return;
+    var cfg = (window.config && window.config.cpWukongTopicChat) || {};
+    var batchUrl = String(cfg.userBatchUrl || CONFIG.usersBatchUrl || "/bridge/nodebb-users");
+    try {
+      var res = await fetch(batchUrl + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
+      if (!res.ok) throw new Error("batch user profile " + res.status);
+      var data = await res.json();
+      var users = Array.isArray(data && data.users) ? data.users : [];
+      users.forEach(function (u) { applyResolvedUser(u && u.uid, u); });
+      saveUserCacheLocalSoon();
+      queueRender("keep");
+    } catch (e) {
+      warn("resolve-users-batch", e);
+      // 批量接口不可用时，只兜底请求少量单用户接口，避免一次性打爆服务器。
+      pending.slice(0, 5).forEach(function (uid) {
+        fetch("/bridge/nodebb-user/" + encodeURIComponent(uid), { credentials: "include" })
+          .then(function (r) { if (!r.ok) throw new Error("user profile " + r.status); return r.json(); })
+          .then(function (u) { applyResolvedUser(uid, u); saveUserCacheLocalSoon(); queueRender("keep"); })
+          .catch(function (err) { warn("resolve-user-fallback", err); });
+      });
+    }
+    if (Object.keys(state.userBatchPending || {}).length) {
+      clearTimeout(state.userBatchTimer);
+      state.userBatchTimer = setTimeout(fetchPendingUsersBatch, 350);
+    }
+  }
+
+  function getAvatarHtml(uid, username) {
+    uid = String(uid || "");
+    var u = getAjaxUserByUid(uid) || state.userCache[uid] || null;
     if (u) username = displayNameFromUser(u, username || (uid ? "用户" + uid : "用户"));
     var pic = (u && u.picture) || "";
     var text = (u && (u.icontext || u["icon:text"])) || String(username || uid || "?").charAt(0).toUpperCase();
     var bg = (u && (u.iconbgColor || u["icon:bgColor"])) || "#72a5f2";
     try {
       if (String(uid) === String(state.uid)) {
-        var me = mergeDeep(mergeDeep({}, (window.app && app.user) || {}), getAjaxUserByUid(uid) || {});
-        if (me && Object.keys(me).length) {
+        var me = getAjaxUserByUid(uid) || (window.app && app.user) || null;
+        if (me) {
           pic = me.picture || pic;
           text = me.icontext || me["icon:text"] || text;
           bg = me.iconbgColor || me["icon:bgColor"] || bg;
@@ -599,25 +730,6 @@
     var flagHtml = flag ? '<span class="cp-avatar-flag" aria-hidden="true">' + esc(flag) + '</span>' : '';
     var onlineHtml = userIsOnline(u) ? '<span class="cp-avatar-online" aria-label="在线"></span>' : '';
     return '<span class="cp-avatar-stack">' + core + flagHtml + onlineHtml + '</span>';
-  }
-
-  function getTopicHeaderUser() {
-    try {
-      var data = (window.ajaxify && ajaxify.data) || {};
-      var pools = [];
-      if (data.author) pools.push(data.author);
-      if (data.mainPost && data.mainPost.user) pools.push(data.mainPost.user);
-      if (data.topic && data.topic.user) pools.push(data.topic.user);
-      if (Array.isArray(data.posts) && data.posts[0] && data.posts[0].user) pools.push(data.posts[0].user);
-      if (data.loggedInUser) pools.push(data.loggedInUser);
-      var ownerUid = String((data.author && data.author.uid) || (data.mainPost && data.mainPost.uid) || (data.posts && data.posts[0] && data.posts[0].uid) || "");
-      for (var i = 0; i < pools.length; i++) {
-        var u = pools[i];
-        if (!u) continue;
-        if (!ownerUid || String(u.uid || "") === ownerUid) return u;
-      }
-    } catch (_) {}
-    return null;
   }
 
   function getUserProfileHref(uid, username) {
@@ -1282,7 +1394,7 @@
 
     if (!changed) return;
     state.messages.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
-    state.messages.forEach(function (m) { if (m && !m.mine && m.uid && (!m.username || /^用户\d+$/.test(m.username))) resolveUserMeta(m.uid); });
+    queueResolveUsersFromMessages(state.messages);
     if (state.messages.length > MAX_RENDER) {
       var removed = state.messages.splice(0, state.messages.length - MAX_RENDER);
       removed.forEach(function (m) { delete state.msgMap[m.id]; });
@@ -2036,10 +2148,7 @@
     var avatar = byId("cp-topic-avatar");
     if (title) title.textContent = state.topic ? state.topic.title : "话题聊天室";
     if (sub) sub.textContent = state.onlineCount > 0 ? ("在线 " + state.onlineCount + " 人") : "";
-    if (avatar) {
-      var headerUser = getTopicHeaderUser();
-      avatar.innerHTML = headerUser ? getAvatarHtml(headerUser.uid || "", displayNameFromUser(headerUser, "#"), headerUser) : '<div class="avatar cp-avatar-fallback" style="background:#72a5f2">#</div>';
-    }
+    if (avatar) avatar.innerHTML = '<div class="avatar cp-avatar-fallback" style="background:#72a5f2">#</div>';
   }
 
   function setStatus(text, lineText) {
@@ -2273,7 +2382,7 @@
       var m = normalizeMessageMedia(msgs[i]);
       var prev = msgs[i - 1];
       var next = msgs[i + 1];
-      if (!m.mine && m.uid) resolveUserMeta(m.uid);
+      if (!m.mine && (!m.username || /^用户\d+$/.test(m.username))) resolveUserMeta(m.uid);
       if (shouldShowTimeSep(prev, m)) html += '<div class="cp-time-sep"><span>' + formatTimeDivider(m.ts) + '</span></div>';
       var samePrev = !!(prev && prev.mine === m.mine && String(prev.uid || "") === String(m.uid || "") && Math.abs((m.ts || 0) - (prev.ts || 0)) < 2 * 60 * 1000 && formatDayLabel(prev.ts) === formatDayLabel(m.ts));
       var sameNext = !!(next && next.mine === m.mine && String(next.uid || "") === String(m.uid || "") && Math.abs((next.ts || 0) - (m.ts || 0)) < 2 * 60 * 1000 && formatDayLabel(next.ts) === formatDayLabel(m.ts));
@@ -3466,6 +3575,7 @@
     state.bg = loadJSON(KEY_BG, DEFAULT_BG);
     state.scrollProgress = loadProgressMap();
     state.onlineCount = 0;
+    loadUserCacheLocal();
 
     injectStyle();
     injectRoot();
@@ -3479,6 +3589,7 @@
     updateHeader();
 
     loadCacheLocalSync();
+    queueResolveUsersFromMessages(state.messages);
     queueRender("bottom");
     setTimeout(function () { if (!restoreCurrentProgress()) forceBottom(); }, 60);
     loadCacheDbAndMerge();
@@ -3506,6 +3617,8 @@
     saveCacheDb();
     stopPresence();
     stopNotifyPolling();
+    clearTimeout(state.userBatchTimer);
+    state.userBatchPending = {};
     var root = byId(ROOT_ID);
     if (root) root.remove();
     var st = byId(STYLE_ID);
