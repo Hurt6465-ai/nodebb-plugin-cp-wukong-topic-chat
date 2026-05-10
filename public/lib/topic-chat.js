@@ -1,5 +1,5 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v33-stable-rc
+ * CP NodeBB Topic WuKong Chat - CID 7 - v34-history-wk-hotfix
  * 重点改动：
  * - 保留板块 7 视觉排序 IIFE，但加防抖，不轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
@@ -12,11 +12,12 @@
  * - v31：修复 log 未定义导致 WK 连接流程中断。
  * - v32：修复缓存/历史重复消息；增强预隐藏、消息定位、未读分割线、@我/回复我的入口、生命周期清理。
  * - v33：修复异步重复挂载、消息 alias、跨话题状态污染、@/回复提醒消除、引用 payload、定位旧消息。
+ * - v34：修复 v33 mount 中 loadCacheDb 未定义导致历史不加载、WK 连接流程不启动的问题。
  */
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V33StableRcInited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V34HistoryWkHotfixInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -1147,6 +1148,45 @@
       });
       db.transaction(STORE, "readwrite").objectStore(STORE).put({ channelId: state.channelId, messages: lite, oldestSeq: state.oldestSeq, newestSeq: state.newestSeq, ts: Date.now() });
     } catch (e) { warn("save-cache-db", e); }
+  }
+
+  async function loadCacheDb() {
+    // v34 hotfix: v33 mount 调用了 loadCacheDb()，但函数被误删，导致后续 ensureTokenAndConnect()/fetchHistory() 不执行。
+    // 这里返回当前话题的 IndexedDB 缓存；如果没有 IDB 缓存，尝试一次性迁移旧 localStorage 缓存。
+    try {
+      var data = null;
+      var db = await openDB();
+      if (db && state.channelId) {
+        data = await new Promise(function (resolve) {
+          try {
+            var req = db.transaction(STORE, "readonly").objectStore(STORE).get(state.channelId);
+            req.onsuccess = function (e) { resolve(e.target.result || null); };
+            req.onerror = function () { resolve(null); };
+          } catch (_) { resolve(null); }
+        });
+      }
+      if (data && Array.isArray(data.messages) && data.messages.length) {
+        return {
+          messages: data.messages,
+          oldestSeq: Number(data.oldestSeq || 0),
+          newestSeq: Number(data.newestSeq || 0),
+          lastTs: Number(data.ts || 0)
+        };
+      }
+      var legacy = await loadLegacyLocalTopicCache();
+      if (legacy && Array.isArray(legacy.messages) && legacy.messages.length) {
+        return {
+          messages: legacy.messages,
+          oldestSeq: Number(legacy.oldestSeq || 0),
+          newestSeq: Number(legacy.newestSeq || 0),
+          lastTs: Number(legacy.ts || Date.now())
+        };
+      }
+      return null;
+    } catch (e) {
+      warn("load-cache-db", e);
+      return null;
+    }
   }
   async function loadCacheDbAndMerge() {
     try {
