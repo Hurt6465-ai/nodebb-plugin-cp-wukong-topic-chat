@@ -1,5 +1,5 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v30-sdk-fix
+ * CP NodeBB Topic WuKong Chat - CID 7 - v31-log-fix
  * 重点改动：
  * - 去掉板块排序 IIFE，不再轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
@@ -9,11 +9,12 @@
  * - 国旗/在线状态稳定版：批量接口优先，合并本地资料，头像资料进入增量渲染 hash。
  * - v29：消息、用户、设置、背景持久化迁移到 IndexedDB。
  * - v30：修正 SDK 锁版本：WuKongIM 服务端 v2.2.5 不是 JS SDK 版本，改为 npm wukongimjssdk@1.2.10。
+ * - v31：修复 log 未定义导致 WK 连接流程中断。
  */
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V30SdkFixInited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V31LogFixInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -201,8 +202,14 @@
   };
 
   function warn(scope, err) {
-    try { console.warn("[cp-topic-wukong-v29-idb-sdk-stable][" + scope + "]", err); } catch (_) {}
+    try { console.warn("[cp-topic-wukong-v31-log-fix][" + scope + "]", err); } catch (_) {}
   }
+
+  function log(scope, data) {
+    if (!CONFIG.debug) return;
+    try { console.log("[cp-topic-wukong-v31-log-fix][" + scope + "]", data || ""); } catch (_) {}
+  }
+
   function byId(id) { return document.getElementById(id); }
   function now() { return Date.now(); }
   function esc(str) {
