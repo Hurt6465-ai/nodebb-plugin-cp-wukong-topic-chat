@@ -1,7 +1,7 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v32-chat-polish
+ * CP NodeBB Topic WuKong Chat - CID 7 - v33-stable-rc
  * 重点改动：
- * - 去掉板块排序 IIFE，不再轮询 /bridge/topic-activity。
+ * - 保留板块 7 视觉排序 IIFE，但加防抖，不轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
  * - DOM 节点复用：data-key 定位节点，data-hash 判断是否需要更新。
  * - 默认只渲染最近 140 条；上滑逐步扩容到 260 条。
@@ -11,11 +11,12 @@
  * - v30：修正 SDK 锁版本：WuKongIM 服务端 v2.2.5 不是 JS SDK 版本，改为 npm wukongimjssdk@1.2.10。
  * - v31：修复 log 未定义导致 WK 连接流程中断。
  * - v32：修复缓存/历史重复消息；增强预隐藏、消息定位、未读分割线、@我/回复我的入口、生命周期清理。
+ * - v33：修复异步重复挂载、消息 alias、跨话题状态污染、@/回复提醒消除、引用 payload、定位旧消息。
  */
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V32ChatPolishInited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V33StableRcInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -141,6 +142,8 @@
 
   var state = {
     mounted: false,
+    mounting: false,
+    mountSeq: 0,
     bootTimer: null,
     topic: null,
     channelId: "",
@@ -178,6 +181,7 @@
     entryCacheLastTs: 0,
     notifyVersion: 0,
     notifyPollTimer: null,
+    noticeDoneTimer: null,
     presenceTimer: null,
     presencePollTimer: null,
     userCache: {},
@@ -209,12 +213,12 @@
   };
 
   function warn(scope, err) {
-    try { console.warn("[cp-topic-wukong-v32-chat-polish][" + scope + "]", err); } catch (_) {}
+    try { console.warn("[cp-topic-wukong-v33-stable-rc][" + scope + "]", err); } catch (_) {}
   }
 
   function log(scope, data) {
     if (!CONFIG.debug) return;
-    try { console.log("[cp-topic-wukong-v32-chat-polish][" + scope + "]", data || ""); } catch (_) {}
+    try { console.log("[cp-topic-wukong-v33-stable-rc][" + scope + "]", data || ""); } catch (_) {}
   }
 
   function byId(id) { return document.getElementById(id); }
@@ -606,7 +610,7 @@
       added = true;
     });
     if (!added) { saveUserCacheLocalSoon(); return; }
-    clearTimeout(state.userBatchTimer);
+    clearTimeout(state.userBatchTimer); clearTimeout(state.noticeDoneTimer); state.noticeDoneTimer = null; state.userBatchPending = {};
     state.userBatchTimer = setTimeout(fetchPendingUsersBatch, 180);
   }
   function queueResolveUsersFromMessages(list) {
@@ -674,6 +678,10 @@
         saveUserCacheLocalSoon();
       } finally {
         delete state.userBatchInflight[inflightKey];
+        if (Object.keys(state.userBatchPending || {}).length) {
+          clearTimeout(state.userBatchTimer); clearTimeout(state.noticeDoneTimer); state.noticeDoneTimer = null; state.userBatchPending = {};
+          state.userBatchTimer = setTimeout(fetchPendingUsersBatch, 250);
+        }
       }
     })();
     return state.userBatchInflight[inflightKey];
@@ -797,6 +805,41 @@
     if (!msg.quote && !msg.quoteMediaUrl && !msg.quoteAudioUrl) msg.quoteType = "";
     return msg;
   }
+  function normalizeReplyObject(payload) {
+    payload = payload || {};
+    var r = payload.reply || payload.wkReply || payload.wk_reply || payload.replyInfo || payload.quoteReply || null;
+    if (r && typeof r === "string") { try { r = JSON.parse(r); } catch (_) { r = null; } }
+    if (!r || typeof r !== "object") return {};
+    var rp = r.payload || r.message || r.content || {};
+    if (rp && typeof rp === "string") { try { rp = JSON.parse(rp); } catch (_) { rp = { text: String(rp) }; } }
+    var qText = r.text || r.quote || r.quote_text || r.content || r.displayContent || r.display_content || rp.text || rp.content || rp.message || "";
+    return {
+      quote: qText,
+      quoteUser: r.from_name || r.fromName || r.username || r.name || r.sender_name || "",
+      quoteUid: r.from_uid || r.fromUid || r.uid || r.sender_uid || "",
+      quoteMsgId: r.message_id || r.messageId || r.client_msg_no || r.clientMsgNo || r.mid || r.id || r.root_mid || "",
+      quoteType: r.type || rp.type || "text",
+      quoteMediaUrl: r.mediaUrl || r.media_url || rp.mediaUrl || rp.url || "",
+      quoteAudioUrl: r.audioUrl || r.audio_url || rp.audioUrl || ""
+    };
+  }
+  function buildReplyPayload(local) {
+    if (!local || !local.quoteMsgId) return null;
+    return {
+      from_uid: String(local.quoteUid || ""),
+      from_name: String(local.quoteUser || ""),
+      message_id: String(local.quoteMsgId || ""),
+      message_seq: Number(local.quoteSeq || 0) || 0,
+      root_mid: String(local.quoteRootMid || local.quoteMsgId || ""),
+      payload: {
+        type: local.quoteType || "text",
+        text: local.quote || "",
+        content: local.quote || "",
+        mediaUrl: local.quoteMediaUrl || "",
+        audioUrl: local.quoteAudioUrl || ""
+      }
+    };
+  }
   function getMentionNoticeType(msg) {
     if (!msg || msg.mine) return "";
     if (String(msg.quoteUid || "") && String(msg.quoteUid || "") === String(state.uid)) return "reply";
@@ -824,6 +867,7 @@
     if (ts && ts < 1000000000000) ts = ts * 1000;
     if (!ts) ts = now();
     if (!id) id = "wk_" + (seq || 0) + "_" + (fromUid || "x") + "_" + (ts || 0) + "_" + normalizeText(serverText).slice(0, 40);
+    var replyObj = normalizeReplyObject(payload);
     var msg = {
       id: id,
       messageId: messageId || id,
@@ -847,13 +891,13 @@
       failed: false,
       local: false,
       wkMsg: m || null,
-      quote: payload.quote_text || payload.quoteText || payload.quote || payload.replyText || payload.replyPreview || "",
-      quoteUser: payload.quoteUser || payload.replyUser || payload.quote_from_name || payload.quoteFromName || "",
-      quoteUid: payload.quote_uid || payload.quoteUid || payload.reply_to_uid || payload.replyToUid || payload.quote_from_uid || payload.quoteFromUid || "",
-      quoteMsgId: payload.quote_msg_id || payload.quoteMsgId || payload.reply_to_msg_id || payload.replyToMsgId || "",
-      quoteType: payload.quote_type || payload.quoteType || payload.reply_type || payload.replyType || "",
-      quoteMediaUrl: payload.quote_media_url || payload.quoteMediaUrl || "",
-      quoteAudioUrl: payload.quote_audio_url || payload.quoteAudioUrl || "",
+      quote: payload.quote_text || payload.quoteText || payload.quote || payload.replyText || payload.replyPreview || replyObj.quote || "",
+      quoteUser: payload.quoteUser || payload.replyUser || payload.quote_from_name || payload.quoteFromName || replyObj.quoteUser || "",
+      quoteUid: payload.quote_uid || payload.quoteUid || payload.reply_to_uid || payload.replyToUid || payload.quote_from_uid || payload.quoteFromUid || replyObj.quoteUid || "",
+      quoteMsgId: payload.quote_msg_id || payload.quoteMsgId || payload.reply_to_msg_id || payload.replyToMsgId || replyObj.quoteMsgId || "",
+      quoteType: payload.quote_type || payload.quoteType || payload.reply_type || payload.replyType || replyObj.quoteType || "",
+      quoteMediaUrl: payload.quote_media_url || payload.quoteMediaUrl || replyObj.quoteMediaUrl || "",
+      quoteAudioUrl: payload.quote_audio_url || payload.quoteAudioUrl || replyObj.quoteAudioUrl || "",
       mentionUids: normalizeMentionList(payload),
       mentionMe: false,
       _ver: 1
@@ -977,6 +1021,12 @@
     registerMsgAliases(local);
     updateSeq(local.seq);
   }
+  function sameMessageSnapshot(a, b) {
+    if (!a || !b) return false;
+    var keys = ["id", "messageId", "clientMsgNo", "seq", "uid", "username", "text", "serverText", "type", "mediaUrl", "audioUrl", "durationStr", "quote", "quoteMsgId", "quoteUid", "quoteUser"];
+    return keys.every(function (k) { return String(a[k] || "") === String(b[k] || ""); }) &&
+      String((a.mentionUids || []).join(",")) === String((b.mentionUids || []).join(","));
+  }
   function updateSeq(seq) {
     seq = Number(seq || 0);
     if (!seq) return;
@@ -1003,9 +1053,12 @@
       }
       var old = findExistingMessage(msg);
       if (old) {
-        mergeServerIntoLocal(old, msg);
-        touchedMessages.push(old);
-        changed = true;
+        if (!sameMessageSnapshot(old, msg)) {
+          mergeServerIntoLocal(old, msg);
+          touchedMessages.push(old);
+          changed = true;
+        }
+        updateSeq(msg.seq);
         return;
       }
       state.messages.push(msg);
@@ -1180,12 +1233,7 @@
     if (!endpoint) throw new Error("请先填写 AI 接口 URL");
     if (!apiKey) throw new Error("请先填写 API Key，或切换为机翻");
     return await withRetry(async function () {
-      var res = await fetchWithTimeout(CONFIG.aiProxyUrl, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ endpoint: endpoint, apiKey: apiKey, model: model, temperature: Number(ai.temperature || 0.2), messages: messages })
-      }, timeout || 12000);
+      var res = await bridgePost(CONFIG.aiProxyUrl, { endpoint: endpoint, apiKey: apiKey, model: model, temperature: Number(ai.temperature || 0.2), messages: messages }, timeout || 12000);
       if (!res.ok) throw new Error(await res.text().catch(function(){ return "AI接口错误"; }));
       var out = extractAIText(await res.json());
       if (!out) throw new Error("AI返回为空");
@@ -1457,6 +1505,7 @@
         scrollRAF = null;
         state.stickToBottom = isAtBottom();
         if (state.stickToBottom) state.unread = 0;
+        clearVisibleNoticesSoon();
         updateFab();
         if (main.scrollTop < 90 && !state.loadingHistory && !state.hasNoMore) {
           if (state.renderLimit < Math.min(MAX_RENDER_LIMIT, state.messages.length)) {
@@ -1470,8 +1519,6 @@
     byId("cp-topic-msg-list").addEventListener("click", onMsgListClick);
     bindLongPress(byId("cp-topic-msg-list"));
     byId("cp-topic-context-overlay").addEventListener("click", function (e) { if (e.target === this) hideContextMenu(); });
-    var atBanner = byId("cp-topic-at-banner");
-    if (atBanner) atBanner.addEventListener("click", function () { scrollToMessageId(atBanner.getAttribute("data-mid") || ""); });
     byId("cp-topic-context-menu").addEventListener("click", onContextMenuClick);
     byId("cp-topic-preview-mask").addEventListener("click", function (e) { if (e.target === this || e.target.closest("[data-act='close-preview']")) closePreview(); });
 
@@ -1751,7 +1798,7 @@
     if (mode === "bottom") { requestAnimationFrame(forceBottom); setTimeout(forceBottom, 80); state.stickToBottom = true; }
     else if (mode === "prepend") main.scrollTop = oldTop + (main.scrollHeight - oldHeight);
     else if (mode === "keep") { if (wasBottom || state.stickToBottom) requestAnimationFrame(forceBottom); else main.scrollTop = oldTop; }
-    observeLazyElements(); updateFab(); updateFooterHeight();
+    observeLazyElements(); clearVisibleNoticesSoon(); updateFab(); updateFooterHeight();
   }
   function initLazyObserver() {
     if (state.lazyObserver) state.lazyObserver.disconnect();
@@ -1989,6 +2036,7 @@
               obj.quote_msg_id = local.quoteMsgId || ""; obj.quoteMsgId = local.quoteMsgId || ""; obj.reply_to_msg_id = local.quoteMsgId || ""; obj.replyToMsgId = local.quoteMsgId || "";
               obj.quote_type = local.quoteType || "text"; obj.quoteType = local.quoteType || "text";
               obj.quote_media_url = local.quoteMediaUrl || ""; obj.quoteMediaUrl = local.quoteMediaUrl || ""; obj.quote_audio_url = local.quoteAudioUrl || ""; obj.quoteAudioUrl = local.quoteAudioUrl || "";
+              obj.reply = buildReplyPayload(local);
             }
             if (mentionUids.length) {
               obj.mention_uids = mentionUids; obj.mentionUids = mentionUids; obj.at_uids = mentionUids; obj.atUsers = mentionUids; obj.at = mentionUids; obj.is_at = 1; obj.mention_type = "users";
@@ -2002,11 +2050,17 @@
       if (sent) {
         local.wkMsg = sent;
         var clientNo = sent.clientMsgNo || sent.client_msg_no || "";
-        if (clientNo) { delete state.msgMap[local.id]; local.id = String(clientNo); state.msgMap[local.id] = local; }
+        if (clientNo) {
+          unregisterMsgAliases(local);
+          local.id = String(clientNo);
+          local.clientMsgNo = String(clientNo);
+          if (!local.messageId || /^local_/i.test(local.messageId)) local.messageId = "";
+          registerMsgAliases(local);
+        }
       }
-      if (CONFIG.notifyUrl && mentionUids.length) {
+      if (CONFIG.notifyUrl && (mentionUids.length || local.quoteUid)) {
         try {
-          bridgePost(CONFIG.notifyUrl, { tid: state.topic.tid, cid: state.topic.cid, channel_id: state.channelId, quote_uid: local.quoteUid || "", quote_msg_id: local.quoteMsgId || "", quote_text: local.quote || "", quote_user: local.quoteUser || "", message_id: local.id || "", client_msg_no: local.id || "", message_text: originalText, mention_uids: mentionUids, text: originalText }).catch(function(){});
+          bridgePost(CONFIG.notifyUrl, { tid: state.topic.tid, cid: state.topic.cid, channel_id: state.channelId, quote_uid: local.quoteUid || "", quote_msg_id: local.quoteMsgId || "", quote_text: local.quote || "", quote_user: local.quoteUser || "", quote_type: local.quoteType || "", quote_media_url: local.quoteMediaUrl || "", quote_audio_url: local.quoteAudioUrl || "", message_id: local.id || "", client_msg_no: local.id || "", message_text: originalText, mention_uids: mentionUids, text: originalText }).catch(function(){});
         } catch (_) {}
       }
       touchTopicActivity(local); touchMsg(local); queueRender("bottom"); saveCacheSoon();
@@ -2365,6 +2419,8 @@
   }
   function deleteLocalMessage(id) {
     if (!id) return;
+    var msg = state.msgMap[String(id)];
+    if (msg) unregisterMsgAliases(msg);
     state.messages = state.messages.filter(function (m) { return String(m.id) !== String(id); });
     delete state.msgMap[id]; saveCacheSoon(); queueRender("keep");
   }
@@ -2386,10 +2442,44 @@
   }
   function hideContextMenu() { byId("cp-topic-context-overlay").hidden = true; state.contextMsg = null; }
 
+  function normalizeNoticeMessageId(rawId) {
+    rawId = String(rawId || "").trim();
+    if (!rawId) return "";
+    var found = findMsgByAnyId(rawId);
+    return found ? String(found.id || rawId) : rawId;
+  }
+  function collectVisibleNoticeIds() {
+    var main = byId("cp-topic-main");
+    if (!main) return [];
+    var box = main.getBoundingClientRect();
+    var ids = [];
+    var rows = document.querySelectorAll("#cp-topic-msg-list .cp-row");
+    Array.prototype.forEach.call(rows, function (row) {
+      var mid = row.getAttribute("data-mid") || "";
+      if (!mid) return;
+      var r = row.getBoundingClientRect();
+      if (r.bottom >= box.top + 12 && r.top <= box.bottom - 12) ids.push(mid);
+    });
+    return ids;
+  }
+  function clearVisibleNoticesSoon() {
+    if (state.noticeDoneTimer) return;
+    state.noticeDoneTimer = setTimeout(function () {
+      state.noticeDoneTimer = null;
+      collectVisibleNoticeIds().forEach(function (id) { markNoticeDone(id, { silent: true }); });
+    }, 350);
+  }
+  function remoteNoticeDone(ids) {
+    ids = (ids || []).map(String).filter(Boolean);
+    if (!ids.length) return;
+    try { bridgePost("/bridge/topic-notify/done", { ids: ids }, 8000).catch(function () {}); } catch (_) {}
+  }
   function addNoticeItem(item) {
     if (!item || !item.id) return false;
+    item.id = normalizeNoticeMessageId(item.id);
     var id = String(item.id);
-    if ((state.mentionNotices || []).some(function (n) { return String(n.id) === id; })) return false;
+    var noticeId = String(item.noticeId || "");
+    if ((state.mentionNotices || []).some(function (n) { return String(n.id) === id || (noticeId && String(n.noticeId || "") === noticeId); })) return false;
     state.mentionNotices = [item].concat(state.mentionNotices || []).slice(0, 50);
     if (item.type === "reply") state.replyNotices = [item].concat(state.replyNotices || []).slice(0, 50);
     else state.atNotices = [item].concat(state.atNotices || []).slice(0, 50);
@@ -2422,7 +2512,7 @@
     if (!mid) return;
     var msg = findMsgByAnyId(mid);
     if (msg && state.messages.indexOf(msg) >= 0) {
-      state.renderLimit = Math.min(MAX_RENDER_LIMIT, Math.max(state.renderLimit, state.messages.length));
+      state.renderLimit = Math.min(MAX_MEMORY, Math.max(state.renderLimit, state.messages.length));
       queueRender("keep");
       setTimeout(function () {
         var row = null;
@@ -2439,12 +2529,20 @@
     toast("正在加载引用消息...");
     fetchHistory(true).then(function () { var m2 = findMsgByAnyId(mid); if (m2) scrollToMessageId(m2.id); else toast("暂时找不到这条消息"); }).catch(function () { toast("暂时找不到这条消息"); });
   }
-  function markNoticeDone(mid) {
-    mid = String(mid || "");
-    state.mentionNotices = (state.mentionNotices || []).filter(function (n) { return String(n.id) !== mid; });
-    state.atNotices = (state.atNotices || []).filter(function (n) { return String(n.id) !== mid; });
-    state.replyNotices = (state.replyNotices || []).filter(function (n) { return String(n.id) !== mid; });
-    updateMentionBanner();
+  function markNoticeDone(mid, opts) {
+    opts = opts || {};
+    mid = normalizeNoticeMessageId(mid);
+    var doneIds = [];
+    function keep(n) {
+      var same = String(n.id) === String(mid) || normalizeNoticeMessageId(n.id) === String(mid);
+      if (same && n.noticeId) doneIds.push(String(n.noticeId));
+      return !same;
+    }
+    state.mentionNotices = (state.mentionNotices || []).filter(keep);
+    state.atNotices = (state.atNotices || []).filter(keep);
+    state.replyNotices = (state.replyNotices || []).filter(keep);
+    if (doneIds.length) remoteNoticeDone(doneIds);
+    if (!opts.silent) updateMentionBanner(); else updateMentionBanner();
   }
   function fetchRemoteNotices() {
     if (!CONFIG.notifyListUrl || !state.topic || !state.uid) return;
@@ -2454,8 +2552,11 @@
         if (!j) return;
         if (j.version != null) state.notifyVersion = Math.max(Number(state.notifyVersion || 0), Number(j.version || 0));
         (Array.isArray(j.list) ? j.list : []).forEach(function (n) {
-          var id = String(n.message_id || n.msg_id || n.client_msg_no || n.id || Math.random());
-          var item = { id: id, type: n.type || "mention", text: n.text || ((n.from_name || "有人") + " @了你"), ts: Date.now() };
+          var rawId = String(n.message_id || n.msg_id || n.client_msg_no || n.clientMsgNo || "");
+          var found = findMsgByAnyId(rawId);
+          var id = found ? String(found.id) : (rawId || String(n.id || Math.random()));
+          var type = n.type || (n.quote_uid || n.quote_msg_id ? "reply" : "mention");
+          var item = { id: id, noticeId: n.id || "", type: type, text: n.text || ((n.from_name || "有人") + (type === "reply" ? " 回复了你" : " @了你")), ts: Date.now() };
           if (addNoticeItem(item)) { updateMentionBanner(); toast(item.text); }
         });
       }).catch(function (e) { warn("remote-notices", e); });
@@ -2553,28 +2654,85 @@
   }
 
   async function mount() {
-    if (state.mounted || !isTargetTopic()) return;
-    state.topic = getTopicInfo(); state.channelId = channelIdOf(state.topic);
-    state.uid = ""; state.messages = []; state.msgMap = {}; state.msgStableMap = {}; state.newestSeq = 0; state.oldestSeq = 0; state.hasNoMore = false; state.loadingHistory = false; state.unread = 0; state.wkReady = false; state.connectStarted = false; state.renderLimit = INITIAL_RENDER_LIMIT; state.mentionNotices = []; state.atNotices = []; state.replyNotices = []; state.unreadDividerMsgId = ""; state.entryCacheNewestSeq = 0; state.entryCacheLastTs = 0; state.pendingRenderMode = ""; state.userBatchInflight = {}; state.mergedUserCache = {}; state.avatarHashCache = {}; state.offlineInflight = false;
-    state.cfg = normalizeConfig(await loadJSON(KEY_CFG, DEFAULT_CFG)); state.bg = await loadJSON(KEY_BG, DEFAULT_BG);
-    await loadUserCacheLocal();
-    injectStyle(); injectRoot(); bindUI(); applyBackground(); renderRecBars(); document.body.classList.add(BODY_CLASS, "cp-topic-chat-mounted");
-    state.mounted = true; initLazyObserver(); updateViewport(); updateFooterHeight(); updateHeader();
-    await loadCacheDbAndMerge(); queueResolveUsersFromMessages(state.messages); queueRender("bottom");
+    if (state.mounted || state.mounting || !isTargetTopic()) return;
+    state.mounting = true;
+    var seq = ++state.mountSeq;
+    function alive() { return seq === state.mountSeq && isTargetTopic(); }
     try {
-      setStatus("连接中");
-      await getToken(); await ensureTopicChannel();
-      connectWk().catch(function (e) { warn("connect", e); setStatus("离线", "悟空 WebSocket 未连接：" + String(e.message || e).slice(0, 120)); });
-      startPresence(); startNotifyPolling(); fetchHistory(false).catch(function (e) { warn("first-history", e); });
-    } catch (e) {
-      warn("mount", e); setStatus("离线", "后端频道订阅或 token 未成功：" + String(e.message || e).slice(0, 120));
+      state.topic = getTopicInfo();
+      state.channelId = channelIdOf(state.topic);
+      state.cfg = normalizeConfig(await loadJSON(KEY_CFG, DEFAULT_CFG));
+      if (!alive()) return;
+      state.bg = await loadJSON(KEY_BG, DEFAULT_BG);
+      if (!alive()) return;
+      await loadUserCacheLocal();
+      if (!alive()) return;
+      document.body.classList.add(BODY_CLASS);
+      document.body.classList.remove("cp-topic-chat-mounted");
+      state.uid = "";
+      state.messages = [];
+      state.msgMap = {};
+      state.msgStableMap = {};
+      state.newestSeq = 0;
+      state.oldestSeq = 0;
+      state.hasNoMore = false;
+      state.loadingHistory = false;
+      state.unread = 0;
+      state.wkReady = false;
+      state.connectStarted = false;
+      state.connected = false;
+      state.statusText = "";
+      state.renderLimit = INITIAL_RENDER_LIMIT;
+      state.mentionNotices = [];
+      state.atNotices = [];
+      state.replyNotices = [];
+      state.unreadDividerMsgId = "";
+      state.entryCacheNewestSeq = 0;
+      state.entryCacheLastTs = 0;
+      state.notifyVersion = 0;
+      state.onlineCount = 0;
+      state.lastHistoryAt = 0;
+      state.pendingRenderMode = "";
+      state.userBatchInflight = {};
+      state.userBatchPending = {};
+      state.mergedUserCache = {};
+      state.avatarHashCache = {};
+      state.offlineInflight = false;
+      state.currentAudioEl = null;
+      state.translateInflight = {};
+      state.contextMsg = null;
+      state.quoteTarget = null;
+      state.previewOpen = false;
+      injectStyle();
+      injectRoot();
+      bindUI();
+      if (!alive()) { unmount(); return; }
+      state.mounted = true;
+      document.body.classList.add("cp-topic-chat-mounted");
+      applyBackground(); refreshLangSelects(); syncTranslateUI(); updateHeader(); updateSendButton(); updateFooterHeight(); initLazyObserver();
+      loadCacheDb().then(function (cache) {
+        if (!alive() || !cache) return;
+        var list = (cache.messages || []).map(function (m) { m._ver = Number(m._ver || 1); return m; });
+        state.entryCacheNewestSeq = Number(cache.newestSeq || 0);
+        state.entryCacheLastTs = Number(cache.lastTs || 0);
+        addMessages(list, { notify: false, scroll: "bottom" });
+        forceBottom();
+      }).catch(function (e) { warn("load-cache-db", e); });
+      ensureTokenAndConnect();
+      fetchHistory(false);
+      startPresence(); startNotifyPolling();
+      setTimeout(function () { if (alive()) { updateViewport(); updateFooterHeight(); forceBottom(); } }, 350);
+    } finally {
+      if (seq === state.mountSeq) state.mounting = false;
     }
   }
   function unmount() {
-    if (!state.mounted) return;
+    state.mountSeq++;
+    state.mounting = false;
+    if (!state.mounted && !byId(ROOT_ID)) return;
     saveCacheDb(); stopPresence(); stopNotifyPolling();
     if (state.uiAbort) { try { state.uiAbort.abort(); } catch (_) {} state.uiAbort = null; }
-    clearTimeout(state.userBatchTimer); clearTimeout(cacheTimer); clearTimeout(footerTimer); clearTimeout(state.bootTimer);
+    clearTimeout(state.userBatchTimer); clearTimeout(state.noticeDoneTimer); state.noticeDoneTimer = null; state.userBatchPending = {}; clearTimeout(cacheTimer); clearTimeout(footerTimer); clearTimeout(state.bootTimer);
     state.userBatchPending = {}; state.userBatchInflight = {}; state.pendingRenderMode = ""; state.renderPending = false;
     if (state.lazyObserver) state.lazyObserver.disconnect(); state.lazyObserver = null;
     try { state.audio.pause(); state.audio.currentTime = 0; } catch (_) {}
@@ -2605,7 +2763,7 @@
 
   window.cpTopicChatDebug = {
     state: state,
-    version: "v32-chat-polish",
+    version: "v33-stable-rc",
     renderNow: function () { queueRender("keep"); },
     forceBottom: forceBottom,
     parseUploadUrl: parseUploadUrl
