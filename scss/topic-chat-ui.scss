@@ -72,7 +72,7 @@ body.cp-topic-chat-on-v20 { overflow:hidden !important; }
       .cp-avatar-spacer { flex-shrink:0; width:40px; height:1px; }
       a.cp-avatar-wrap { text-decoration:none; color:inherit; }
       .cp-mention-me { outline:2px solid rgba(59,130,246,.20); box-shadow:0 0 0 4px rgba(59,130,246,.08); }
-      .cp-at-pill { display:inline-block; color:#2563eb; background:rgba(37,99,235,.10); border:1px solid rgba(37,99,235,.12); border-radius:999px; padding:0 6px; margin:0 1px; font-weight:800; line-height:1.45; }
+      .cp-at-pill { display:inline; color:#2563eb; background:transparent!important; border:0!important; border-radius:0!important; padding:0!important; margin:0 1px; font-weight:800; line-height:inherit; box-shadow:none!important; }
       .cp-global-notify { position:fixed; left:12px; right:12px; top:calc(12px + env(safe-area-inset-top)); z-index:2147483300; display:flex; align-items:center; justify-content:space-between; gap:10px; min-height:42px; padding:10px 12px; border:1px solid rgba(255,255,255,.55); border-radius:18px; background:rgba(255,255,255,.86); backdrop-filter:blur(18px); box-shadow:0 12px 30px rgba(15,23,42,.18); color:#111827; font-size:14px; font-weight:800; }
       .cp-global-notify span { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
       .cp-global-notify button { border:0; background:transparent; color:#94a3b8; font-size:18px; padding:2px 4px; }
@@ -675,3 +675,23 @@ body.cp-topic-chat-on-v20 { overflow:hidden !important; }
   border-radius: 0 !important;
   box-shadow: none !important;
 }
+
+
+/* v28: final avatar overlay guard. Keep flags visible even when older rules set overflow:hidden. */
+#cp-topic-chat-root .cp-avatar-wrap,
+#cp-topic-chat-root .cp-peer-avatar,
+#cp-topic-chat-root .cp-avatar-stack {
+  overflow: visible !important;
+}
+#cp-topic-chat-root .cp-avatar-flag {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+
+
+/* v33 stable-rc overrides */
+.cp-at-pill { display:inline; color:#2563eb; background:transparent!important; border:0!important; border-radius:0!important; padding:0!important; margin:0 1px; font-weight:800; line-height:inherit; box-shadow:none!important; }
+.cp-reply-me-hint { cursor:pointer; }
+.cp-quote-card { cursor:pointer; }
