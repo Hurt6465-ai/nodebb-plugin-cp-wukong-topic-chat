@@ -1,5 +1,5 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v29-idb-sdk-stable
+ * CP NodeBB Topic WuKong Chat - CID 7 - v30-sdk-fix
  * 重点改动：
  * - 去掉板块排序 IIFE，不再轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
@@ -7,12 +7,13 @@
  * - 默认只渲染最近 140 条；上滑逐步扩容到 260 条。
  * - 保留媒体压缩、背景压缩、活动触达、批量用户资料缓存。
  * - 国旗/在线状态稳定版：批量接口优先，合并本地资料，头像资料进入增量渲染 hash。
- * - v29：WuKongIM SDK 锁定版本；消息、用户、设置、背景持久化迁移到 IndexedDB。
+ * - v29：消息、用户、设置、背景持久化迁移到 IndexedDB。
+ * - v30：修正 SDK 锁版本：WuKongIM 服务端 v2.2.5 不是 JS SDK 版本，改为 npm wukongimjssdk@1.2.10。
  */
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V29IdbSdkStableInited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V30SdkFixInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -24,10 +25,9 @@
     ensureUrl: "/bridge/topic-channel/ensure",
     historyUrl: "/bridge/topic-history",
     legacyHistoryUrl: "/bridge/get-history",
-    sdkVersion: "2.2.5-20260422",
+    sdkVersion: "1.2.10",
     sdkUrls: [
-      "https://cdn.jsdelivr.net/npm/wukongimjssdk@2.2.5-20260422/lib/wukongimjssdk.umd.js",
-      "https://cdn.jsdelivr.net/npm/wukongimjssdk@v2.2.5-20260422/lib/wukongimjssdk.umd.js"
+      "https://cdn.jsdelivr.net/npm/wukongimjssdk@1.2.10/lib/wukongimjssdk.umd.js"
     ],
     historyLimit: 30,
     aiProxyUrl: "/bridge/ai/chat",
@@ -1710,8 +1710,8 @@
     return new Promise(function (resolve, reject) {
       if (window.wk && window.wk.WKSDK) return resolve();
       var urls = Array.isArray(CONFIG.sdkUrls) && CONFIG.sdkUrls.length ? CONFIG.sdkUrls.slice() : [];
-      if (CONFIG.sdkUrl && urls.indexOf(CONFIG.sdkUrl) < 0 && CONFIG.sdkUrl.indexOf("latest") < 0) urls.push(CONFIG.sdkUrl);
-      var existing = document.querySelector('script[data-cp-wk-sdk="1"], script[src*="wukongimjssdk@2.2.5-20260422"], script[src*="wukongimjssdk@v2.2.5-20260422"]');
+      if (CONFIG.sdkUrl && urls.indexOf(CONFIG.sdkUrl) < 0) urls.push(CONFIG.sdkUrl);
+      var existing = document.querySelector('script[data-cp-wk-sdk="1"], script[src*="wukongimjssdk@1.2.10"]');
       if (existing) {
         existing.addEventListener("load", function () { resolve(); }, { once: true });
         existing.addEventListener("error", function () { reject(new Error("WKSDK script error")); }, { once: true });
@@ -1727,7 +1727,11 @@
         s.src = url;
         s.async = true;
         s.dataset.cpWkSdk = "1";
-        s.onload = function () { resolve(); };
+        s.onload = function () {
+          if (window.wk && window.wk.WKSDK) return resolve();
+          try { s.remove(); } catch (_) {}
+          loadNext(new Error("WKSDK loaded but global wk.WKSDK missing: " + url));
+        };
         s.onerror = function () {
           try { s.remove(); } catch (_) {}
           loadNext(new Error("WKSDK load failed: " + url));
@@ -1737,6 +1741,16 @@
       loadNext();
     });
   }
+  function isWkConnectedStatus(status) {
+    if (status === 1 || status === "connected" || status === "connect" || status === "success") return true;
+    var text = "";
+    try {
+      if (status && typeof status === "object") text = String(status.status || status.type || status.name || status.value || status.code || "").toLowerCase();
+      else text = String(status || "").toLowerCase();
+    } catch (_) {}
+    return text === "connected" || text === "connect" || text === "success" || text === "connected_success";
+  }
+
   async function connectWk() {
     if (state.connectStarted) return;
     state.connectStarted = true;
@@ -1745,7 +1759,8 @@
     var shared = window.wk.WKSDK.shared();
     shared.config.uid = state.uid;
     shared.config.token = state.token;
-    shared.config.addr = (state.tokenData && state.tokenData.addr) || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/wkws/");
+    shared.config.addr = (state.tokenData && (state.tokenData.addr || state.tokenData.wsAddr || state.tokenData.wkws)) || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/wkws/");
+    log("wk-connect", { addr: shared.config.addr, uid: state.uid, sdkVersion: CONFIG.sdkVersion });
     if (!shared.__cpTopicV29IdbSdkStableListener) {
       shared.chatManager.addMessageListener(function (m) {
         try {
@@ -1761,13 +1776,15 @@
       });
       shared.__cpTopicV29IdbSdkStableListener = true;
     }
-    if (shared.connectManager && !shared.connectManager.__cpTopicV26PerfStatus) {
-      shared.connectManager.addConnectStatusListener(function (status) {
-        var ok = status === 1 || status === "connected" || status === "connect";
+    if (shared.connectManager && !shared.connectManager.__cpTopicV30SdkFixStatus) {
+      shared.connectManager.addConnectStatusListener(function (status, reasonCode) {
+        log("wk-status", { status: status, reasonCode: reasonCode, addr: shared.config.addr });
+        var ok = isWkConnectedStatus(status);
+        state.connected = !!ok;
         setStatus(ok ? "已连接" : "连接中");
         if (ok && state.newestSeq) fetchOffline();
       });
-      shared.connectManager.__cpTopicV26PerfStatus = true;
+      shared.connectManager.__cpTopicV30SdkFixStatus = true;
     }
     shared.connectManager.connect();
     state.wkReady = true;
@@ -2422,7 +2439,7 @@
     try {
       setStatus("连接中");
       await getToken(); await ensureTopicChannel();
-      connectWk().catch(function (e) { warn("connect", e); setStatus("离线", "悟空 WebSocket 未连接，只能看缓存/历史。检查 /wkws/。"); });
+      connectWk().catch(function (e) { warn("connect", e); setStatus("离线", "悟空 WebSocket 未连接：" + String(e.message || e).slice(0, 120)); });
       startPresence(); startNotifyPolling(); fetchHistory(false).catch(function (e) { warn("first-history", e); });
     } catch (e) {
       warn("mount", e); setStatus("离线", "后端频道订阅或 token 未成功：" + String(e.message || e).slice(0, 120));
