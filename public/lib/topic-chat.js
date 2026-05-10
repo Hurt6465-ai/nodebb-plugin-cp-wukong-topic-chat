@@ -1,5 +1,5 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v27-perf-stable
+ * CP NodeBB Topic WuKong Chat - CID 7 - v29-idb-sdk-stable
  * 重点改动：
  * - 去掉板块排序 IIFE，不再轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
@@ -7,11 +7,12 @@
  * - 默认只渲染最近 140 条；上滑逐步扩容到 260 条。
  * - 保留媒体压缩、背景压缩、活动触达、批量用户资料缓存。
  * - 国旗/在线状态稳定版：批量接口优先，合并本地资料，头像资料进入增量渲染 hash。
+ * - v29：WuKongIM SDK 锁定版本；消息、用户、设置、背景持久化迁移到 IndexedDB。
  */
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V27PerfStableInited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V29IdbSdkStableInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -23,7 +24,11 @@
     ensureUrl: "/bridge/topic-channel/ensure",
     historyUrl: "/bridge/topic-history",
     legacyHistoryUrl: "/bridge/get-history",
-    sdkUrl: "https://cdn.jsdelivr.net/npm/wukongimjssdk@latest/lib/wukongimjssdk.umd.js",
+    sdkVersion: "2.2.5-20260422",
+    sdkUrls: [
+      "https://cdn.jsdelivr.net/npm/wukongimjssdk@2.2.5-20260422/lib/wukongimjssdk.umd.js",
+      "https://cdn.jsdelivr.net/npm/wukongimjssdk@v2.2.5-20260422/lib/wukongimjssdk.umd.js"
+    ],
     historyLimit: 30,
     aiProxyUrl: "/bridge/ai/chat",
     googleProxyUrl: "/bridge/translate/google",
@@ -41,8 +46,10 @@
   var ROOT_ID = "cp-topic-chat-root";
   var BODY_CLASS = "cp-topic-chat-on-v20";
   var DB_NAME = "CP_TOPIC_WUKONG_CACHE_V27_PERF_STABLE";
+  var DB_VERSION = 2;
   var STORE = "topics";
-  var LS_PREFIX = "cp_topic_wk_cache_v27_perf_stable_";
+  var KV_STORE = "kv";
+  var LS_PREFIX = "cp_topic_wk_cache_v27_perf_stable_"; // legacy localStorage key prefix, read once for migration only
   var KEY_CFG = "cp_topic_wk_cfg_v27_perf_stable";
   var KEY_BG = "cp_topic_wk_bg_v27_perf_stable";
   var KEY_USER_CACHE = "cp_topic_wk_user_cache_v31_profile";
@@ -148,6 +155,7 @@
     newestSeq: 0,
     oldestSeq: 0,
     renderPending: false,
+    pendingRenderMode: "",
     renderLimit: INITIAL_RENDER_LIMIT,
     stickToBottom: true,
     unread: 0,
@@ -167,6 +175,12 @@
     userCache: {},
     userBatchPending: {},
     userBatchTimer: null,
+    userBatchInflight: {},
+    mergedUserCache: {},
+    avatarHashCache: {},
+    uiAbort: null,
+    offlineInflight: false,
+    lastActivityTouch: {},
     contextMsg: null,
     quoteTarget: null,
     audio: new Audio(),
@@ -187,7 +201,7 @@
   };
 
   function warn(scope, err) {
-    try { console.warn("[cp-topic-wukong-v27-perf-stable][" + scope + "]", err); } catch (_) {}
+    try { console.warn("[cp-topic-wukong-v29-idb-sdk-stable][" + scope + "]", err); } catch (_) {}
   }
   function byId(id) { return document.getElementById(id); }
   function now() { return Date.now(); }
@@ -208,17 +222,47 @@
     });
     return base;
   }
-  function loadJSON(key, fallback) {
+  async function loadJSON(key, fallback) {
+    var base = cloneJSON(fallback);
     try {
-      var raw = localStorage.getItem(key);
-      return raw ? mergeDeep(cloneJSON(fallback), JSON.parse(raw)) : cloneJSON(fallback);
+      var stored = await idbGetKV(key);
+      if (stored !== undefined && stored !== null) {
+        return mergeDeep(base, typeof stored === "string" ? JSON.parse(stored) : cloneJSON(stored));
+      }
+      // One-time legacy migration from old localStorage builds. After migration, remove the key.
+      var raw = null;
+      try { raw = localStorage.getItem(key); } catch (_) {}
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        await idbSetKV(key, parsed);
+        try { localStorage.removeItem(key); } catch (_) {}
+        return mergeDeep(base, parsed);
+      }
     } catch (e) {
-      warn("load-json", e);
-      return cloneJSON(fallback);
+      warn("load-json-idb", e);
     }
+    return base;
   }
   function saveJSON(key, val) {
-    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { warn("save-json", e); }
+    idbSetKV(key, cloneJSON(val)).catch(function (e) { warn("save-json-idb", e); });
+  }
+  function safeCssColor(v) {
+    v = String(v || "").trim();
+    if (/^#[0-9a-f]{3,8}$/i.test(v)) return v;
+    if (/^rgba?\(\s*[\d.\s,%]+\)$/i.test(v)) return v;
+    if (/^hsla?\(\s*[\d.\s,%]+\)$/i.test(v)) return v;
+    return "#72a5f2";
+  }
+  function csrfToken() {
+    try { return (window.config && (config.csrf_token || config.csrfToken)) || ""; } catch (_) { return ""; }
+  }
+  function bridgePost(url, body, timeout) {
+    return fetchWithTimeout(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", "x-csrf-token": csrfToken() },
+      body: JSON.stringify(body || {})
+    }, timeout || 12000);
   }
   function normalizeConfig(cfg) {
     cfg = mergeDeep(cloneJSON(DEFAULT_CFG), cfg || {});
@@ -346,9 +390,10 @@
       status: normalizeUserField(raw, ["status", "userStatus", "presence", "onlineStatus"]),
       language_flag: normalizeUserField(raw, ["language_flag", "languageFlag", "countryFlag", "country_flag", "flag", "nationality", "country", "localeCountry"]),
       online: userIsOnline(raw),
-      profileVersion: Number(raw.profileVersion || raw.version || 0) || Date.now(),
-      cacheAt: Date.now(),
-      cacheExpiresAt: Date.now() + USER_CACHE_TTL_MS
+      profileVersion: Number(raw.profileVersion || raw.version || 0) || 0,
+      cacheAt: Number(raw.cacheAt || 0) || 0,
+      cacheExpiresAt: Number(raw.cacheExpiresAt || 0) || 0,
+      remoteResolved: !!raw.remoteResolved
     };
   }
   function userHasProfileBadges(u) {
@@ -372,9 +417,36 @@
     }
     return out;
   }
+  function userProfileUiKey(u) {
+    u = u || {};
+    return [
+      u.picture || u.uploadedpicture || "",
+      u.userslug || u.slug || u.username || "",
+      u.displayname || u.fullname || u.name || u.username || "",
+      u.icontext || u["icon:text"] || "",
+      u.iconbgColor || u["icon:bgColor"] || "",
+      u.language_flag || u.languageFlag || u.countryFlag || u.country_flag || u.flag || u.nationality || u.country || "",
+      u.status || u.userStatus || u.presence || u.onlineStatus || "",
+      userIsOnline(u) ? 1 : 0
+    ].join("|");
+  }
+  function invalidateUserProfile(uid) {
+    uid = String(uid || "");
+    if (!uid) return;
+    if (state.mergedUserCache) delete state.mergedUserCache[uid];
+    if (state.avatarHashCache) delete state.avatarHashCache[uid];
+  }
   function getMergedUserByUid(uid) {
     uid = String(uid || "");
-    return mergeUserObjects(getAjaxUserByUid(uid) || {}, state.userCache[uid] || {});
+    var local = getAjaxUserByUid(uid) || {};
+    var cached = state.userCache[uid] || {};
+    var ver = userProfileUiKey(local) + "||" + userProfileUiKey(cached) + "||" + (cached.remoteResolved ? 1 : 0);
+    var memo = state.mergedUserCache && state.mergedUserCache[uid];
+    if (memo && memo.ver === ver) return memo.data;
+    var data = mergeUserObjects(local, cached);
+    state.mergedUserCache = state.mergedUserCache || {};
+    state.mergedUserCache[uid] = { ver: ver, data: data };
+    return data;
   }
   function displayNameForMessage(msg) {
     if (!msg) return "用户";
@@ -414,16 +486,21 @@
     return "";
   }
   function avatarProfileHash(uid) {
+    uid = String(uid || "");
     var u = getMergedUserByUid(uid);
-    return [
+    var hash = [
       u.picture || "",
       u.userslug || "",
+      u.displayname || u.fullname || u.username || "",
+      u.icontext || u["icon:text"] || "",
+      u.iconbgColor || u["icon:bgColor"] || "",
       u.language_flag || u.languageFlag || u.countryFlag || u.country_flag || u.flag || u.nationality || u.country || "",
-      u.status || "",
-      userIsOnline(u) ? 1 : 0,
-      u.profileVersion || 0,
-      u.cacheAt || 0
-    ].join(",");
+      u.status || u.userStatus || u.presence || u.onlineStatus || "",
+      userIsOnline(u) ? 1 : 0
+    ].join("|");
+    state.avatarHashCache = state.avatarHashCache || {};
+    state.avatarHashCache[uid] = hash;
+    return hash;
   }
   function getAvatarHtml(uid, username) {
     uid = String(uid || "");
@@ -431,7 +508,7 @@
     if (u) username = displayNameFromUser(u, username || (uid ? "用户" + uid : "用户"));
     var pic = u.picture || "";
     var text = (u.icontext || u["icon:text"]) || String(username || uid || "?").charAt(0).toUpperCase();
-    var bg = (u.iconbgColor || u["icon:bgColor"]) || "#72a5f2";
+    var bg = safeCssColor((u.iconbgColor || u["icon:bgColor"]) || "#72a5f2");
     var core = pic ? '<img class="avatar" src="' + escAttr(pic) + '" />' : '<div class="avatar cp-avatar-fallback" style="background:' + escAttr(bg) + '">' + esc(text) + '</div>';
     var flag = flagEmojiFromLanguageFlag(u.language_flag || u.languageFlag || u.countryFlag || u.country_flag || u.flag || u.nationality || u.country || "");
     var flagHtml = flag ? '<span class="cp-avatar-flag" aria-hidden="true">' + esc(flag) + '</span>' : '';
@@ -446,11 +523,19 @@
     return slug ? ("/user/" + encodeURIComponent(String(slug)) + "/topics") : "#";
   }
 
-  function loadUserCacheLocal() {
+  async function loadUserCacheLocal() {
     try {
-      var raw = localStorage.getItem(KEY_USER_CACHE);
-      if (!raw) return;
-      var data = JSON.parse(raw);
+      var data = await idbGetKV(KEY_USER_CACHE);
+      if (!data) {
+        // One-time legacy migration from old localStorage profile cache.
+        var raw = null;
+        try { raw = localStorage.getItem(KEY_USER_CACHE); } catch (_) {}
+        if (raw) {
+          data = JSON.parse(raw);
+          await idbSetKV(KEY_USER_CACHE, data);
+          try { localStorage.removeItem(KEY_USER_CACHE); } catch (_) {}
+        }
+      }
       if (!data || Number(data.version || 0) < 31) return;
       var users = data && data.users ? data.users : {};
       var n = Date.now();
@@ -458,27 +543,36 @@
         var u = users[uid];
         if (u && (!u.cacheExpiresAt || Number(u.cacheExpiresAt) > n)) state.userCache[String(uid)] = u;
       });
-    } catch (e) { warn("load-user-cache", e); }
+    } catch (e) { warn("load-user-cache-idb", e); }
   }
   function saveUserCacheLocalSoon() {
     clearTimeout(state.userCacheTimer);
     state.userCacheTimer = setTimeout(function () {
-      try { localStorage.setItem(KEY_USER_CACHE, JSON.stringify({ version: 31, ts: Date.now(), users: state.userCache || {} })); } catch (_) {}
-    }, 600);
+      idbSetKV(KEY_USER_CACHE, { version: 31, ts: Date.now(), users: state.userCache || {} }).catch(function (e) { warn("save-user-cache-idb", e); });
+    }, 1000);
   }
-  function applyResolvedUser(uid, user) {
+  function applyResolvedUser(uid, user, opts) {
+    opts = opts || {};
     uid = String(uid || (user && user.uid) || "");
     if (!uid || !user) return false;
+    var before = avatarProfileHash(uid);
     var prev = state.userCache[uid] || {};
     var normalized = normalizeUserProfile(user, uid);
     var merged = mergeUserObjects(prev, normalized);
     merged.loaded = true;
     merged.uid = uid;
-    merged.cacheAt = Date.now();
-    merged.cacheExpiresAt = Date.now() + USER_CACHE_TTL_MS;
-    merged.profileVersion = Date.now();
-    var before = avatarProfileHash(uid);
+    merged.remoteResolved = !!(opts.remote || prev.remoteResolved || normalized.remoteResolved);
+    if (opts.remote) {
+      merged.cacheAt = Date.now();
+      merged.cacheExpiresAt = Date.now() + USER_CACHE_TTL_MS;
+    } else {
+      merged.cacheAt = Number(prev.cacheAt || 0) || 0;
+      merged.cacheExpiresAt = Number(prev.cacheExpiresAt || 0) || 0;
+    }
+    var stableVersion = userProfileUiKey(merged);
+    merged.profileVersion = stableVersion;
     state.userCache[uid] = merged;
+    invalidateUserProfile(uid);
     return before !== avatarProfileHash(uid);
   }
   function queueResolveUsers(uids, force) {
@@ -488,10 +582,12 @@
       uid = String(uid || "").trim();
       if (!uid) return;
       var local = getAjaxUserByUid(uid);
-      if (local) applyResolvedUser(uid, local);
+      var localChanged = false;
+      if (local) localChanged = applyResolvedUser(uid, local, { remote: false });
       var cached = state.userCache[uid];
-      var hasFreshBadges = cached && cached.loaded && userHasProfileBadges(cached) && cached.cacheAt && (Date.now() - Number(cached.cacheAt)) < USER_CACHE_STALE_REFRESH_MS;
-      if (!force && hasFreshBadges) return;
+      var hasFreshRemote = cached && cached.loaded && cached.remoteResolved && cached.cacheAt && (Date.now() - Number(cached.cacheAt)) < USER_CACHE_STALE_REFRESH_MS;
+      if (localChanged) queueRender("keep");
+      if (!force && hasFreshRemote) return;
       state.userBatchPending[uid] = true;
       added = true;
     });
@@ -513,38 +609,60 @@
     var pending = Object.keys(state.userBatchPending || {}).slice(0, 80);
     pending.forEach(function (uid) { delete state.userBatchPending[uid]; });
     if (!pending.length) return;
-    var baseUrl = String(((window.config && window.config.cpWukongTopicChat) || {}).userBatchUrl || CONFIG.usersBatchUrl || "/nodebb-users");
-    var urls = [];
-    function addUrl(u) { if (u && urls.indexOf(u) < 0) urls.push(u); }
-    addUrl(baseUrl);
-    if (baseUrl.indexOf("/bridge/") !== 0) addUrl("/bridge" + baseUrl);
-    addUrl("/nodebb-users");
-    addUrl("/bridge/nodebb-users");
-    try {
-      var data = null;
-      var lastErr = null;
-      for (var i = 0; i < urls.length; i++) {
-        try {
-          var res = await fetch(urls[i] + "?uids=" + encodeURIComponent(pending.join(",")) + "&_=" + Date.now(), { credentials: "include", cache: "no-store" });
-          if (!res.ok) { lastErr = new Error("user batch " + res.status + " @ " + urls[i]); continue; }
-          data = await res.json();
-          break;
-        } catch (e) { lastErr = e; }
+    pending = pending.sort();
+    var inflightKey = pending.join(",");
+    state.userBatchInflight = state.userBatchInflight || {};
+    if (state.userBatchInflight[inflightKey]) return state.userBatchInflight[inflightKey];
+    state.userBatchInflight[inflightKey] = (async function () {
+      var baseUrl = String(((window.config && window.config.cpWukongTopicChat) || {}).userBatchUrl || CONFIG.usersBatchUrl || "/nodebb-users");
+      var urls = [];
+      function addUrl(u) { if (u && urls.indexOf(u) < 0) urls.push(u); }
+      addUrl(baseUrl);
+      addUrl("/nodebb-users");
+      if (baseUrl.indexOf("/bridge/") !== 0) addUrl("/bridge" + baseUrl);
+      addUrl("/bridge/nodebb-users");
+      try {
+        var data = null;
+        var lastErr = null;
+        for (var i = 0; i < urls.length; i++) {
+          try {
+            var res = await fetchWithTimeout(urls[i] + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" }, 12000);
+            if (!res.ok) { lastErr = new Error("user batch " + res.status + " @ " + urls[i]); continue; }
+            data = await res.json();
+            break;
+          } catch (e) { lastErr = e; }
+        }
+        if (!data) throw lastErr || new Error("user batch empty");
+        var changed = false;
+        var returned = {};
+        (Array.isArray(data && data.users) ? data.users : []).forEach(function (u) {
+          if (!u || !u.uid) return;
+          returned[String(u.uid)] = true;
+          if (applyResolvedUser(u.uid, u, { remote: true })) changed = true;
+        });
+        // 后端没有返回的 uid 也打上 remoteResolved，避免每次进房间都重复请求。
+        pending.forEach(function (uid) {
+          if (returned[uid]) return;
+          if (!state.userCache[uid]) state.userCache[uid] = { loaded: false, uid: uid };
+          state.userCache[uid].remoteResolved = true;
+          state.userCache[uid].cacheAt = Date.now();
+          state.userCache[uid].cacheExpiresAt = Date.now() + USER_CACHE_TTL_MS;
+        });
+        saveUserCacheLocalSoon();
+        if (changed) queueRender("keep");
+      } catch (e) {
+        warn("resolve-users", e);
+        pending.forEach(function (uid) {
+          if (!state.userCache[uid]) state.userCache[uid] = { loaded: false, uid: uid };
+          state.userCache[uid].remoteResolved = false;
+          state.userCache[uid].cacheAt = Date.now() - USER_CACHE_STALE_REFRESH_MS + 30000;
+        });
+        saveUserCacheLocalSoon();
+      } finally {
+        delete state.userBatchInflight[inflightKey];
       }
-      if (!data) throw lastErr || new Error("user batch empty");
-      var changed = false;
-      (Array.isArray(data && data.users) ? data.users : []).forEach(function (u) { if (applyResolvedUser(u && u.uid, u)) changed = true; });
-      saveUserCacheLocalSoon();
-      if (changed) queueRender("keep");
-    } catch (e) {
-      warn("resolve-users", e);
-      // 失败时保留本地资料，不反复刷接口；30 秒后才允许再次尝试。
-      pending.forEach(function (uid) {
-        if (!state.userCache[uid]) state.userCache[uid] = { loaded: false, uid: uid };
-        state.userCache[uid].cacheAt = Date.now() - USER_CACHE_STALE_REFRESH_MS + 30000;
-      });
-      saveUserCacheLocalSoon();
-    }
+    })();
+    return state.userBatchInflight[inflightKey];
   }
 
   function decodePayload(m) {
@@ -689,7 +807,7 @@
     var ts = Number(m.timestamp || m.clientTimestamp || payload.timestamp || 0);
     if (ts && ts < 1000000000000) ts = ts * 1000;
     if (!ts) ts = now();
-    if (!id) id = "wk_" + (seq || Date.now()) + "_" + Math.floor(Math.random() * 10000);
+    if (!id) id = "wk_" + (seq || 0) + "_" + (fromUid || "x") + "_" + (ts || 0) + "_" + normalizeText(serverText).slice(0, 40);
     var msg = {
       id: id,
       seq: seq,
@@ -775,8 +893,9 @@
   function addMessages(list, opts) {
     opts = opts || {};
     var changed = false;
+    var touchedMessages = [];
     var seenSoft = {};
-    state.messages.forEach(function (m) { seenSoft[textDedupKey(m, 10000)] = true; });
+    state.messages.forEach(function (m) { if (!m.seq && !m.id) seenSoft[textDedupKey(m, 10000)] = true; });
     (list || []).forEach(function (msg) {
       if (!msg || !msg.id) return;
       sanitizeQuoteFields(msg);
@@ -802,13 +921,17 @@
         sanitizeQuoteFields(old);
         touchMsg(old);
         updateSeq(old.seq);
+        touchedMessages.push(old);
         changed = true;
         return;
       }
-      var sk = textDedupKey(msg, 10000);
-      if (seenSoft[sk]) return;
-      seenSoft[sk] = true;
+      if (!msg.seq && !msg.id) {
+        var sk = textDedupKey(msg, 10000);
+        if (seenSoft[sk]) return;
+        seenSoft[sk] = true;
+      }
       state.messages.push(msg);
+      touchedMessages.push(msg);
       state.msgMap[msg.id] = msg;
       updateSeq(msg.seq);
       if (opts.notify !== false && !msg.mine && getMentionNoticeType(msg)) setTimeout(function () { pushMentionNotice(msg); }, 0);
@@ -820,74 +943,114 @@
       var removed = state.messages.splice(0, state.messages.length - MAX_MEMORY);
       removed.forEach(function (m) { delete state.msgMap[m.id]; });
     }
-    queueResolveUsersFromMessages(state.messages);
+    queueResolveUsersFromMessages(touchedMessages);
     saveCacheSoon();
     queueRender(opts.scroll || "keep");
   }
 
   function cacheKey() { return LS_PREFIX + state.channelId; }
   function saveCacheLocalSync() {
-    if (!state.channelId) return;
-    try {
-      localStorage.setItem(cacheKey(), JSON.stringify({ channelId: state.channelId, messages: state.messages.slice(-MAX_CACHE), oldestSeq: state.oldestSeq, newestSeq: state.newestSeq, ts: Date.now() }));
-    } catch (e) { warn("save-cache-local", e); }
+    // v29: no localStorage writes. Message cache persistence is IndexedDB-only.
   }
-  function loadCacheLocalSync() {
-    if (!state.channelId) return;
+  async function loadLegacyLocalTopicCache() {
+    if (!state.channelId) return null;
     try {
       var raw = localStorage.getItem(cacheKey());
-      if (!raw) return;
+      if (!raw) return null;
       var data = JSON.parse(raw);
-      if (!data || !Array.isArray(data.messages)) return;
-      state.messages = data.messages.slice(-MAX_CACHE);
-      state.msgMap = {};
-      state.messages.forEach(function (m) {
-        m.sending = false; m.failed = false; m.local = false; m._ver = Number(m._ver || 1);
-        sanitizeQuoteFields(m); state.msgMap[m.id] = m;
-      });
-      state.oldestSeq = Number(data.oldestSeq || 0);
-      state.newestSeq = Number(data.newestSeq || 0);
-    } catch (e) { warn("load-cache-local", e); }
+      try { localStorage.removeItem(cacheKey()); } catch (_) {}
+      return data && Array.isArray(data.messages) ? data : null;
+    } catch (e) { warn("migrate-legacy-topic-cache", e); return null; }
+  }
+  function loadCacheLocalSync() {
+    // v29: no localStorage reads during normal startup. Use loadCacheDbAndMerge().
   }
   function openDB() {
     if (dbPromise) return dbPromise;
     dbPromise = new Promise(function (resolve) {
       if (!window.indexedDB) return resolve(null);
-      var req = indexedDB.open(DB_NAME, 1);
+      var req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = function (e) {
         var db = e.target.result;
         if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: "channelId" });
+        if (!db.objectStoreNames.contains(KV_STORE)) db.createObjectStore(KV_STORE, { keyPath: "key" });
       };
       req.onsuccess = function (e) { resolve(e.target.result); };
       req.onerror = function () { resolve(null); };
+      req.onblocked = function () { resolve(null); };
     });
     return dbPromise;
+  }
+  async function idbGetKV(key) {
+    try {
+      var db = await openDB();
+      if (!db || !db.objectStoreNames.contains(KV_STORE)) return null;
+      return await new Promise(function (resolve) {
+        var req = db.transaction(KV_STORE, "readonly").objectStore(KV_STORE).get(String(key));
+        req.onsuccess = function (e) { resolve(e.target.result ? e.target.result.value : null); };
+        req.onerror = function () { resolve(null); };
+      });
+    } catch (e) { warn("idb-get-kv", e); return null; }
+  }
+  async function idbSetKV(key, value) {
+    try {
+      var db = await openDB();
+      if (!db || !db.objectStoreNames.contains(KV_STORE)) return false;
+      return await new Promise(function (resolve) {
+        var req = db.transaction(KV_STORE, "readwrite").objectStore(KV_STORE).put({ key: String(key), value: value, ts: Date.now() });
+        req.onsuccess = function () { resolve(true); };
+        req.onerror = function () { resolve(false); };
+      });
+    } catch (e) { warn("idb-set-kv", e); return false; }
   }
   async function saveCacheDb() {
     try {
       var db = await openDB();
       if (!db || !state.channelId) return;
-      db.transaction(STORE, "readwrite").objectStore(STORE).put({ channelId: state.channelId, messages: state.messages.slice(-MAX_CACHE), oldestSeq: state.oldestSeq, newestSeq: state.newestSeq, ts: Date.now() });
+      var lite = state.messages.slice(-MAX_CACHE).map(function (m) {
+        var c = {};
+        Object.keys(m || {}).forEach(function (k) { if (k !== "wkMsg" && k !== "_ver") c[k] = m[k]; });
+        return c;
+      });
+      db.transaction(STORE, "readwrite").objectStore(STORE).put({ channelId: state.channelId, messages: lite, oldestSeq: state.oldestSeq, newestSeq: state.newestSeq, ts: Date.now() });
     } catch (e) { warn("save-cache-db", e); }
   }
   async function loadCacheDbAndMerge() {
     try {
       var db = await openDB();
-      if (!db || !state.channelId) return;
-      await new Promise(function (resolve) {
-        var req = db.transaction(STORE, "readonly").objectStore(STORE).get(state.channelId);
-        req.onsuccess = function (e) {
-          var data = e.target.result;
-          if (data && Array.isArray(data.messages) && data.messages.length) addMessages(data.messages, { scroll: "bottom", notify: false });
-          resolve();
-        };
-        req.onerror = function () { resolve(); };
-      });
+      var loaded = false;
+      if (db && state.channelId) {
+        await new Promise(function (resolve) {
+          var req = db.transaction(STORE, "readonly").objectStore(STORE).get(state.channelId);
+          req.onsuccess = function (e) {
+            var data = e.target.result;
+            if (data && Array.isArray(data.messages) && data.messages.length) {
+              addMessages(data.messages, { scroll: "bottom", notify: false });
+              loaded = true;
+            }
+            resolve();
+          };
+          req.onerror = function () { resolve(); };
+        });
+      }
+      // One-time migration of legacy localStorage message cache if IDB has no topic cache yet.
+      if (!loaded) {
+        var legacy = await loadLegacyLocalTopicCache();
+        if (legacy && Array.isArray(legacy.messages) && legacy.messages.length) {
+          addMessages(legacy.messages, { scroll: "bottom", notify: false });
+          state.oldestSeq = state.oldestSeq || Number(legacy.oldestSeq || 0);
+          state.newestSeq = Math.max(state.newestSeq || 0, Number(legacy.newestSeq || 0));
+          saveCacheDb();
+        }
+      }
     } catch (e) { warn("load-cache-db", e); }
   }
   function saveCacheSoon() {
     clearTimeout(cacheTimer);
-    cacheTimer = setTimeout(function () { saveCacheLocalSync(); saveCacheDb(); }, 350);
+    cacheTimer = setTimeout(function () {
+      var idle = window.requestIdleCallback || function (fn) { setTimeout(fn, 0); };
+      idle(function () { saveCacheDb(); });
+    }, 1500);
   }
 
   function fetchWithTimeout(url, opts, ms) {
@@ -1137,6 +1300,9 @@
   }
 
   function bindUI() {
+    if (state.uiAbort) state.uiAbort.abort();
+    state.uiAbort = window.AbortController ? new AbortController() : null;
+    var uiSignal = state.uiAbort ? state.uiAbort.signal : undefined;
     byId("cp-topic-back").onclick = function () { if (history.length > 1) history.back(); else location.href = "/category/" + CONFIG.targetCid; };
     byId("cp-topic-settings").onclick = openSettings;
     byId("cp-topic-settings-close").onclick = closeSettings;
@@ -1182,12 +1348,17 @@
     byId("cp-topic-rec-cancel").onclick = function () { stopRecording(false); };
     byId("cp-topic-rec-send").onclick = function () { stopRecording(true); };
     byId("cp-topic-rec-pause").onclick = togglePauseRecording;
-    state.audio.addEventListener("ended", onAudioEnded);
+    state.audio.addEventListener("ended", onAudioEnded, uiSignal ? { signal: uiSignal } : false);
 
     document.addEventListener("click", function (e) {
       var pop = byId("cp-topic-media-pop");
       if (pop && !pop.hidden && !e.target.closest("#cp-topic-media-pop") && !e.target.closest("#cp-topic-plus")) pop.hidden = true;
-    });
+    }, uiSignal ? { signal: uiSignal } : false);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && state.mounted) {
+        pingTopicPresence(); fetchTopicPresence(); fetchRemoteNotices(); fetchOffline();
+      }
+    }, uiSignal ? { signal: uiSignal } : false);
 
     var input = byId("cp-topic-input");
     input.addEventListener("input", function () { autoGrow(input); updateSendButton(); updateFooterHeight(); });
@@ -1221,8 +1392,8 @@
 
     if (window.visualViewport) {
       var vh = function () { updateViewport(); updateFooterHeight(); };
-      window.visualViewport.addEventListener("resize", vh, { passive: true });
-      window.visualViewport.addEventListener("scroll", vh, { passive: true });
+      window.visualViewport.addEventListener("resize", vh, uiSignal ? { passive: true, signal: uiSignal } : { passive: true });
+      window.visualViewport.addEventListener("scroll", vh, uiSignal ? { passive: true, signal: uiSignal } : { passive: true });
     }
   }
   function refreshLangSelects() {
@@ -1354,12 +1525,21 @@
     else badge.hidden = true;
   }
 
+  function mergeRenderMode(oldMode, newMode) {
+    var rank = { keep: 1, prepend: 2, bottom: 3 };
+    oldMode = oldMode || "keep";
+    newMode = newMode || "keep";
+    return (rank[newMode] || 1) > (rank[oldMode] || 1) ? newMode : oldMode;
+  }
   function queueRender(mode) {
+    state.pendingRenderMode = mergeRenderMode(state.pendingRenderMode || "keep", mode || "keep");
     if (state.renderPending) return;
     state.renderPending = true;
     requestAnimationFrame(function () {
+      var finalMode = state.pendingRenderMode || "keep";
+      state.pendingRenderMode = "";
       state.renderPending = false;
-      renderIncremental(mode || "keep");
+      renderIncremental(finalMode);
     });
   }
   function shouldShowTimeSep(prev, cur) {
@@ -1523,18 +1703,38 @@
     state.uid = String(json.uid); state.token = String(json.token); state.username = json.username || getMyName(); state.tokenData = json;
   }
   async function ensureTopicChannel() {
-    var res = await fetch(CONFIG.ensureUrl, {
-      method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tid: state.topic.tid, cid: state.topic.cid, title: state.topic.title, channel_id: state.channelId, channel_type: CONFIG.channelType, temp_subscriber: 1 })
-    });
+    var res = await bridgePost(CONFIG.ensureUrl, { tid: state.topic.tid, cid: state.topic.cid, title: state.topic.title, channel_id: state.channelId, channel_type: CONFIG.channelType, temp_subscriber: 1 });
     if (!res.ok) throw new Error("ensure http " + res.status);
   }
   function ensureSdk() {
     return new Promise(function (resolve, reject) {
       if (window.wk && window.wk.WKSDK) return resolve();
-      var old = document.querySelector('script[src*="wukongimjssdk"]');
-      if (old) { old.addEventListener("load", resolve); old.addEventListener("error", reject); setTimeout(function(){ if (window.wk && window.wk.WKSDK) resolve(); }, 600); return; }
-      var s = document.createElement("script"); s.src = CONFIG.sdkUrl; s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
+      var urls = Array.isArray(CONFIG.sdkUrls) && CONFIG.sdkUrls.length ? CONFIG.sdkUrls.slice() : [];
+      if (CONFIG.sdkUrl && urls.indexOf(CONFIG.sdkUrl) < 0 && CONFIG.sdkUrl.indexOf("latest") < 0) urls.push(CONFIG.sdkUrl);
+      var existing = document.querySelector('script[data-cp-wk-sdk="1"], script[src*="wukongimjssdk@2.2.5-20260422"], script[src*="wukongimjssdk@v2.2.5-20260422"]');
+      if (existing) {
+        existing.addEventListener("load", function () { resolve(); }, { once: true });
+        existing.addEventListener("error", function () { reject(new Error("WKSDK script error")); }, { once: true });
+        setTimeout(function () { if (window.wk && window.wk.WKSDK) resolve(); }, 600);
+        return;
+      }
+      var i = 0;
+      function loadNext(lastErr) {
+        if (window.wk && window.wk.WKSDK) return resolve();
+        if (i >= urls.length) return reject(lastErr || new Error("WKSDK load failed"));
+        var url = urls[i++];
+        var s = document.createElement("script");
+        s.src = url;
+        s.async = true;
+        s.dataset.cpWkSdk = "1";
+        s.onload = function () { resolve(); };
+        s.onerror = function () {
+          try { s.remove(); } catch (_) {}
+          loadNext(new Error("WKSDK load failed: " + url));
+        };
+        document.head.appendChild(s);
+      }
+      loadNext();
     });
   }
   async function connectWk() {
@@ -1546,7 +1746,7 @@
     shared.config.uid = state.uid;
     shared.config.token = state.token;
     shared.config.addr = (state.tokenData && state.tokenData.addr) || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/wkws/");
-    if (!shared.__cpTopicV26PerfListener) {
+    if (!shared.__cpTopicV29IdbSdkStableListener) {
       shared.chatManager.addMessageListener(function (m) {
         try {
           if (!state.mounted || !sameTopicChannel(m)) return;
@@ -1559,7 +1759,7 @@
           if (!wasBottom && !msg.mine) { state.unread++; updateFab(); }
         } catch (e) { warn("message-listener", e); }
       });
-      shared.__cpTopicV26PerfListener = true;
+      shared.__cpTopicV29IdbSdkStableListener = true;
     }
     if (shared.connectManager && !shared.connectManager.__cpTopicV26PerfStatus) {
       shared.connectManager.addConnectStatusListener(function (status) {
@@ -1579,8 +1779,8 @@
     if (json && Array.isArray(json.messages)) return json.messages;
     return [];
   }
-  async function fetchJson(url) {
-    var res = await fetch(url, { credentials: "include" });
+  async function fetchJson(url, timeout) {
+    var res = await fetchWithTimeout(url, { credentials: "include" }, timeout || 12000);
     if (!res.ok) throw new Error("http " + res.status);
     return res.json();
   }
@@ -1607,12 +1807,15 @@
     }
   }
   async function fetchOffline() {
+    if (state.offlineInflight) return;
     if (!state.newestSeq || Date.now() - state.lastHistoryAt < 1500) return;
+    state.offlineInflight = true;
     var q = "?channel_id=" + encodeURIComponent(state.channelId) + "&channel_type=" + encodeURIComponent(CONFIG.channelType) + "&tid=" + encodeURIComponent(state.topic.tid) + "&limit=50&start_message_seq=" + encodeURIComponent(state.newestSeq + 1);
     try {
       var msgs = normalizeHistory(await fetchJson(CONFIG.historyUrl + q)).map(function (m) { return msgFromWk(m); });
       if (msgs.length) addMessages(msgs, { scroll: isAtBottom() ? "bottom" : "keep" });
     } catch (_) {}
+    finally { state.offlineInflight = false; }
   }
 
   async function sendCurrent() {
@@ -1695,7 +1898,7 @@
       }
       if (CONFIG.notifyUrl && mentionUids.length) {
         try {
-          fetch(CONFIG.notifyUrl, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tid: state.topic.tid, cid: state.topic.cid, channel_id: state.channelId, quote_uid: local.quoteUid || "", quote_msg_id: local.quoteMsgId || "", quote_text: local.quote || "", quote_user: local.quoteUser || "", message_id: local.id || "", client_msg_no: local.id || "", message_text: originalText, mention_uids: mentionUids, text: originalText }) }).catch(function(){});
+          bridgePost(CONFIG.notifyUrl, { tid: state.topic.tid, cid: state.topic.cid, channel_id: state.channelId, quote_uid: local.quoteUid || "", quote_msg_id: local.quoteMsgId || "", quote_text: local.quote || "", quote_user: local.quoteUser || "", message_id: local.id || "", client_msg_no: local.id || "", message_text: originalText, mention_uids: mentionUids, text: originalText }).catch(function(){});
         } catch (_) {}
       }
       touchTopicActivity(local); touchMsg(local); queueRender("bottom"); saveCacheSoon();
@@ -2102,7 +2305,7 @@
   }
   function fetchRemoteNotices() {
     if (!CONFIG.notifyListUrl || !state.topic || !state.uid) return;
-    fetch(CONFIG.notifyListUrl + "?tid=" + encodeURIComponent(state.topic.tid) + "&after=" + encodeURIComponent(state.notifyVersion || 0) + "&_=" + Date.now(), { credentials: "include", cache: "no-store" })
+    fetchWithTimeout(CONFIG.notifyListUrl + "?tid=" + encodeURIComponent(state.topic.tid) + "&after=" + encodeURIComponent(state.notifyVersion || 0) + "&_=" + Date.now(), { credentials: "include", cache: "no-store" }, 12000)
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) {
         if (!j) return;
@@ -2116,23 +2319,31 @@
       }).catch(function (e) { warn("remote-notices", e); });
   }
   function startNotifyPolling() {
-    stopNotifyPolling(); fetchRemoteNotices(); state.notifyPollTimer = setInterval(fetchRemoteNotices, 12000);
+    stopNotifyPolling();
+    fetchRemoteNotices();
+    state.notifyPollTimer = setInterval(function () {
+      if (document.visibilityState !== "visible") return;
+      fetchRemoteNotices();
+    }, 60000);
   }
   function stopNotifyPolling() { if (state.notifyPollTimer) clearInterval(state.notifyPollTimer); state.notifyPollTimer = null; }
   function pingTopicPresence() {
     if (!CONFIG.presencePingUrl || !state.topic || !state.uid) return;
     try {
-      fetch(CONFIG.presencePingUrl, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tid: state.topic.tid, cid: state.topic.cid, channel_id: state.channelId }) }).catch(function(){});
+      bridgePost(CONFIG.presencePingUrl, { tid: state.topic.tid, cid: state.topic.cid, channel_id: state.channelId }, 8000).catch(function(){});
     } catch (_) {}
   }
   function fetchTopicPresence() {
     if (!CONFIG.presenceUrl || !state.topic) return;
-    fetch(CONFIG.presenceUrl + "?tid=" + encodeURIComponent(state.topic.tid) + "&_=" + Date.now(), { credentials: "include", cache: "no-store" })
+    fetchWithTimeout(CONFIG.presenceUrl + "?tid=" + encodeURIComponent(state.topic.tid) + "&_=" + Date.now(), { credentials: "include", cache: "no-store" }, 8000)
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) { if (j) { state.onlineCount = Number(j.count || 0); updateHeader(); } }).catch(function(){});
   }
   function startPresence() {
-    stopPresence(); pingTopicPresence(); fetchTopicPresence(); state.presenceTimer = setInterval(pingTopicPresence, 30000); state.presencePollTimer = setInterval(fetchTopicPresence, 20000);
+    stopPresence();
+    pingTopicPresence(); fetchTopicPresence();
+    state.presenceTimer = setInterval(function () { if (document.visibilityState === "visible") pingTopicPresence(); }, 60000);
+    state.presencePollTimer = setInterval(function () { if (document.visibilityState === "visible") fetchTopicPresence(); }, 45000);
   }
   function stopPresence() {
     if (state.presenceTimer) clearInterval(state.presenceTimer);
@@ -2141,8 +2352,11 @@
   }
   function touchTopicActivity(msg) {
     if (!CONFIG.activityTouchUrl || !state.topic) return;
+    var k = String(state.topic.tid || "");
+    if (Date.now() - Number((state.lastActivityTouch || {})[k] || 0) < 5000) return;
+    state.lastActivityTouch[k] = Date.now();
     try {
-      fetch(CONFIG.activityTouchUrl, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tid: state.topic.tid, cid: state.topic.cid, title: state.topic.title, channel_id: state.channelId, text: msg && (msg.serverText || msg.text || "") }) }).catch(function(){});
+      bridgePost(CONFIG.activityTouchUrl, { tid: state.topic.tid, cid: state.topic.cid, title: state.topic.title, channel_id: state.channelId, text: msg && (msg.serverText || msg.text || "") }, 8000).catch(function(){});
     } catch (_) {}
   }
   async function compressBackgroundToDataUrl(file) {
@@ -2199,12 +2413,12 @@
   async function mount() {
     if (state.mounted || !isTargetTopic()) return;
     state.topic = getTopicInfo(); state.channelId = channelIdOf(state.topic);
-    state.uid = ""; state.messages = []; state.msgMap = {}; state.newestSeq = 0; state.oldestSeq = 0; state.hasNoMore = false; state.loadingHistory = false; state.unread = 0; state.wkReady = false; state.connectStarted = false; state.renderLimit = INITIAL_RENDER_LIMIT; state.mentionNotices = [];
-    state.cfg = normalizeConfig(loadJSON(KEY_CFG, DEFAULT_CFG)); state.bg = loadJSON(KEY_BG, DEFAULT_BG);
-    loadUserCacheLocal();
+    state.uid = ""; state.messages = []; state.msgMap = {}; state.newestSeq = 0; state.oldestSeq = 0; state.hasNoMore = false; state.loadingHistory = false; state.unread = 0; state.wkReady = false; state.connectStarted = false; state.renderLimit = INITIAL_RENDER_LIMIT; state.mentionNotices = []; state.pendingRenderMode = ""; state.userBatchInflight = {}; state.mergedUserCache = {}; state.avatarHashCache = {}; state.offlineInflight = false;
+    state.cfg = normalizeConfig(await loadJSON(KEY_CFG, DEFAULT_CFG)); state.bg = await loadJSON(KEY_BG, DEFAULT_BG);
+    await loadUserCacheLocal();
     injectStyle(); injectRoot(); bindUI(); applyBackground(); renderRecBars(); document.body.classList.add(BODY_CLASS);
     state.mounted = true; initLazyObserver(); updateViewport(); updateFooterHeight(); updateHeader();
-    loadCacheLocalSync(); queueResolveUsersFromMessages(state.messages); queueRender("bottom"); loadCacheDbAndMerge();
+    await loadCacheDbAndMerge(); queueResolveUsersFromMessages(state.messages); queueRender("bottom");
     try {
       setStatus("连接中");
       await getToken(); await ensureTopicChannel();
@@ -2216,9 +2430,15 @@
   }
   function unmount() {
     if (!state.mounted) return;
-    saveCacheLocalSync(); saveCacheDb(); stopPresence(); stopNotifyPolling();
+    saveCacheDb(); stopPresence(); stopNotifyPolling();
+    if (state.uiAbort) { try { state.uiAbort.abort(); } catch (_) {} state.uiAbort = null; }
     clearTimeout(state.userBatchTimer); if (state.lazyObserver) state.lazyObserver.disconnect(); state.lazyObserver = null;
     try { state.audio.pause(); } catch (_) {}
+    try {
+      if (state.rec.mediaRecorder && state.rec.mediaRecorder.state !== "inactive") { state.rec.shouldSend = false; state.rec.mediaRecorder.stop(); }
+      if (state.rec.stream) state.rec.stream.getTracks().forEach(function (t) { t.stop(); });
+    } catch (_) {}
+    clearInterval(state.rec.timer); state.rec.timer = null;
     var root = byId(ROOT_ID); if (root) root.remove();
     document.body.classList.remove(BODY_CLASS, "cp-topic-chat-on-v13", "cp-topic-chat-on-v14", "cp-topic-chat-on-v18", "cp-topic-chat-on-v20", "cp-topic-has-bg");
     state.mounted = false;
@@ -2240,7 +2460,7 @@
 
   window.cpTopicChatDebug = {
     state: state,
-    version: "v27-perf-stable",
+    version: "v29-idb-sdk-stable",
     renderNow: function () { queueRender("keep"); },
     forceBottom: forceBottom,
     parseUploadUrl: parseUploadUrl
@@ -2251,8 +2471,8 @@
 /* Optional category 7 visual sort by WuKong topic chat activity. No polling; runs after page load/ajaxify only. */
 (function () {
   "use strict";
-  if (window.__cpCategory7ActivitySortV27Stable) return;
-  window.__cpCategory7ActivitySortV27Stable = true;
+  if (window.__cpCategory7ActivitySortV28Stable) return;
+  window.__cpCategory7ActivitySortV28Stable = true;
   var CID = 7;
   function isCat7() {
     return document.body && document.body.classList.contains("page-category") && /\/category\/7(?:\/|$)/.test(location.pathname);
@@ -2274,11 +2494,15 @@
     });
     return rows;
   }
+  var lastFetchAt = 0;
   async function sortByActivity() {
     if (!isCat7()) return;
+    var n = Date.now();
+    if (n - lastFetchAt < 8000) return;
+    lastFetchAt = n;
     var rows = findTopicRows();
     if (!rows.length) return;
-    var res = await fetch('/bridge/topic-activity?cid=' + CID + '&_=' + Date.now(), { credentials: 'include', cache: 'no-store' }).catch(function () { return null; });
+    var res = await fetch('/bridge/topic-activity?cid=' + CID, { credentials: 'include', cache: 'no-store' }).catch(function () { return null; });
     if (!res || !res.ok) return;
     var json = await res.json().catch(function () { return null; });
     var list = (json && json.list) || [];
@@ -2287,7 +2511,7 @@
     rows.sort(function (a, b) { return (map[b.tid] || 0) - (map[a.tid] || 0); });
     rows.forEach(function (x) { if (x.parent && x.row) x.parent.appendChild(x.row); });
   }
-  function boot() { setTimeout(sortByActivity, 450); setTimeout(sortByActivity, 1200); }
+  function boot() { setTimeout(sortByActivity, 450); }
   if (window.jQuery) $(window).on("action:ajaxify.end", boot);
   document.addEventListener("DOMContentLoaded", boot);
   window.addEventListener("load", boot);
