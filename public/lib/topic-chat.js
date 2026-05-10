@@ -1,5 +1,5 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v31-log-fix
+ * CP NodeBB Topic WuKong Chat - CID 7 - v32-chat-polish
  * 重点改动：
  * - 去掉板块排序 IIFE，不再轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
@@ -10,11 +10,12 @@
  * - v29：消息、用户、设置、背景持久化迁移到 IndexedDB。
  * - v30：修正 SDK 锁版本：WuKongIM 服务端 v2.2.5 不是 JS SDK 版本，改为 npm wukongimjssdk@1.2.10。
  * - v31：修复 log 未定义导致 WK 连接流程中断。
+ * - v32：修复缓存/历史重复消息；增强预隐藏、消息定位、未读分割线、@我/回复我的入口、生命周期清理。
  */
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V31LogFixInited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V32ChatPolishInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -153,6 +154,7 @@
     hasNoMore: false,
     messages: [],
     msgMap: {},
+    msgStableMap: {},
     newestSeq: 0,
     oldestSeq: 0,
     renderPending: false,
@@ -169,6 +171,11 @@
     pendingMentionUids: [],
     pendingMentionMap: {},
     mentionNotices: [],
+    atNotices: [],
+    replyNotices: [],
+    unreadDividerMsgId: "",
+    entryCacheNewestSeq: 0,
+    entryCacheLastTs: 0,
     notifyVersion: 0,
     notifyPollTimer: null,
     presenceTimer: null,
@@ -202,12 +209,12 @@
   };
 
   function warn(scope, err) {
-    try { console.warn("[cp-topic-wukong-v31-log-fix][" + scope + "]", err); } catch (_) {}
+    try { console.warn("[cp-topic-wukong-v32-chat-polish][" + scope + "]", err); } catch (_) {}
   }
 
   function log(scope, data) {
     if (!CONFIG.debug) return;
-    try { console.log("[cp-topic-wukong-v31-log-fix][" + scope + "]", data || ""); } catch (_) {}
+    try { console.log("[cp-topic-wukong-v32-chat-polish][" + scope + "]", data || ""); } catch (_) {}
   }
 
   function byId(id) { return document.getElementById(id); }
@@ -809,6 +816,8 @@
     var parsedServer = detectMessageKind(serverText, payload);
     var displayText = mine && payload.originalText ? payload.originalText : parsedServer.text;
     var parsedDisplay = detectMessageKind(displayText, payload);
+    var messageId = String(m.message_id || m.messageID || m.messageId || (payload && payload.message_id) || "");
+    var clientMsgNo = String(m.client_msg_no || m.clientMsgNo || m.client_msgNo || (payload && (payload.client_msg_no || payload.clientMsgNo)) || "");
     var id = extractMsgId(m, payload);
     var seq = Number(m.message_seq || m.messageSeq || m.message_seq_no || 0);
     var ts = Number(m.timestamp || m.clientTimestamp || payload.timestamp || 0);
@@ -817,6 +826,8 @@
     if (!id) id = "wk_" + (seq || 0) + "_" + (fromUid || "x") + "_" + (ts || 0) + "_" + normalizeText(serverText).slice(0, 40);
     var msg = {
       id: id,
+      messageId: messageId || id,
+      clientMsgNo: clientMsgNo || id,
       seq: seq,
       uid: fromUid || (mine ? state.uid : ""),
       username: mine ? getMyName() : (payload.username || payload.name || (fromUid ? "用户" + fromUid : "用户")),
@@ -848,6 +859,7 @@
       _ver: 1
     };
     sanitizeQuoteFields(msg);
+    msg.stableKey = msgStableKey(msg, true);
     msg.mentionMe = getMentionNoticeType(msg) !== "";
     return msg;
   }
@@ -856,6 +868,72 @@
     bucketMs = bucketMs || 10000;
     var body = mediaKeyOf(msg) || normalizeText(msg.serverText || msg.text || "");
     return [msg.mine ? "me" : String(msg.uid || ""), msg.type || "text", body, Math.floor((msg.ts || 0) / bucketMs)].join("|");
+  }
+  function shortHash(str) {
+    str = String(str || "");
+    var h = 0;
+    for (var i = 0; i < str.length; i++) h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+    return String(Math.abs(h));
+  }
+  function getRawMsgField(msg, keys) {
+    msg = msg || {};
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (msg[k] !== undefined && msg[k] !== null && String(msg[k]).trim() !== "") return String(msg[k]).trim();
+      if (msg.wkMsg && msg.wkMsg[k] !== undefined && msg.wkMsg[k] !== null && String(msg.wkMsg[k]).trim() !== "") return String(msg.wkMsg[k]).trim();
+    }
+    return "";
+  }
+  function msgStableKey(msg, allowSoft) {
+    if (!msg) return "";
+    var cid = state.channelId || getMsgChannelId(msg.wkMsg) || "topic";
+    var mid = getRawMsgField(msg, ["messageId", "messageID", "message_id"]);
+    if (mid && !/^local_/i.test(mid)) return "mid:" + mid;
+    var cno = msg.clientMsgNo || getRawMsgField(msg, ["clientMsgNo", "client_msg_no", "client_msgNo"]);
+    if (cno && !/^local_/i.test(cno)) return "client:" + cno;
+    var seq = Number(msg.seq || getRawMsgField(msg, ["messageSeq", "message_seq", "message_seq_no"]) || 0);
+    if (seq > 0) return "seq:" + cid + ":" + seq;
+    if (allowSoft === false) return "";
+    var body = mediaKeyOf(msg) || normalizeText(msg.serverText || msg.text || "");
+    if (!body) return "";
+    return "soft:" + cid + ":" + (msg.mine ? "me" : String(msg.uid || "")) + ":" + (msg.type || "text") + ":" + shortHash(body) + ":" + Math.floor((msg.ts || 0) / 3000);
+  }
+  function registerMsgAliases(msg) {
+    if (!msg || !msg.id) return;
+    state.msgMap[msg.id] = msg;
+    var keys = [msgStableKey(msg, false), msgStableKey(msg, true), msg.messageId ? "mid:" + msg.messageId : "", msg.clientMsgNo ? "client:" + msg.clientMsgNo : ""].filter(Boolean);
+    state.msgStableMap = state.msgStableMap || {};
+    keys.forEach(function (k) { state.msgStableMap[k] = msg.id; });
+  }
+  function unregisterMsgAliases(msg) {
+    if (!msg) return;
+    if (msg.id) delete state.msgMap[msg.id];
+    var keys = [msgStableKey(msg, false), msgStableKey(msg, true), msg.messageId ? "mid:" + msg.messageId : "", msg.clientMsgNo ? "client:" + msg.clientMsgNo : ""].filter(Boolean);
+    state.msgStableMap = state.msgStableMap || {};
+    keys.forEach(function (k) { if (state.msgStableMap[k] === msg.id) delete state.msgStableMap[k]; });
+  }
+  function findExistingMessage(msg) {
+    if (!msg) return null;
+    if (msg.id && state.msgMap[msg.id]) return state.msgMap[msg.id];
+    var keys = [msgStableKey(msg, false), msgStableKey(msg, true), msg.messageId ? "mid:" + msg.messageId : "", msg.clientMsgNo ? "client:" + msg.clientMsgNo : ""].filter(Boolean);
+    for (var i = 0; i < keys.length; i++) {
+      var id = state.msgStableMap && state.msgStableMap[keys[i]];
+      if (id && state.msgMap[id]) return state.msgMap[id];
+    }
+    return null;
+  }
+  function findMsgByAnyId(id) {
+    id = String(id || "").trim();
+    if (!id) return null;
+    if (state.msgMap[id]) return state.msgMap[id];
+    var mapId = state.msgStableMap && (state.msgStableMap["mid:" + id] || state.msgStableMap["client:" + id] || state.msgStableMap["seq:" + state.channelId + ":" + id]);
+    if (mapId && state.msgMap[mapId]) return state.msgMap[mapId];
+    for (var i = 0; i < state.messages.length; i++) {
+      var m = state.messages[i];
+      if (!m) continue;
+      if (String(m.id || "") === id || String(m.messageId || "") === id || String(m.clientMsgNo || "") === id || String(m.seq || "") === id) return m;
+    }
+    return null;
   }
   function touchMsg(m) { if (m) m._ver = (Number(m._ver) || 0) + 1; }
   function findPendingMine(serverMsg) {
@@ -872,23 +950,31 @@
     return null;
   }
   function mergeServerIntoLocal(local, server) {
-    delete state.msgMap[local.id];
+    unregisterMsgAliases(local);
     local.id = server.id || local.id;
+    local.messageId = server.messageId || local.messageId || local.id;
+    local.clientMsgNo = server.clientMsgNo || local.clientMsgNo || local.id;
+    local.stableKey = server.stableKey || msgStableKey(server, true) || local.stableKey;
     local.seq = server.seq || local.seq || 0;
     local.uid = server.uid || local.uid;
     local.username = server.username || local.username;
     local.ts = server.ts || local.ts;
     local.type = server.type || local.type;
+    local.text = server.text || local.text;
     local.serverText = server.serverText || local.serverText || server.text;
     local.mediaUrl = server.mediaUrl || local.mediaUrl || "";
     local.audioUrl = server.audioUrl || local.audioUrl || "";
     local.durationStr = server.durationStr || local.durationStr || "";
+    ["quote","quoteUser","quoteUid","quoteMsgId","quoteType","quoteMediaUrl","quoteAudioUrl"].forEach(function (k) { if (server[k] && !local[k]) local[k] = server[k]; });
+    if (server.mentionUids && server.mentionUids.length) local.mentionUids = server.mentionUids;
+    local.mentionMe = local.mentionMe || server.mentionMe || getMentionNoticeType(local) !== "";
     local.sending = false;
     local.failed = false;
     local.local = false;
     local.wkMsg = server.wkMsg || local.wkMsg;
+    sanitizeQuoteFields(local);
     touchMsg(local);
-    state.msgMap[local.id] = local;
+    registerMsgAliases(local);
     updateSeq(local.seq);
   }
   function updateSeq(seq) {
@@ -901,54 +987,41 @@
     opts = opts || {};
     var changed = false;
     var touchedMessages = [];
-    var seenSoft = {};
-    state.messages.forEach(function (m) { if (!m.seq && !m.id) seenSoft[textDedupKey(m, 10000)] = true; });
+    var firstUnreadCandidate = null;
     (list || []).forEach(function (msg) {
       if (!msg || !msg.id) return;
       sanitizeQuoteFields(msg);
+      msg.stableKey = msg.stableKey || msgStableKey(msg, true);
       if (msg.mine) {
         var p = findPendingMine(msg);
         if (p && p.id !== msg.id) {
           mergeServerIntoLocal(p, msg);
+          touchedMessages.push(p);
           changed = true;
           return;
         }
       }
-      if (state.msgMap[msg.id]) {
-        var old = state.msgMap[msg.id];
-        old.sending = false;
-        old.failed = false;
-        old.seq = old.seq || msg.seq;
-        old.ts = msg.ts || old.ts;
-        old.serverText = msg.serverText || old.serverText || msg.text;
-        if (msg.translation && !old.translation) { old.translation = msg.translation; old.translationOpen = true; }
-        ["quote","quoteUser","quoteUid","quoteMsgId","quoteType","quoteMediaUrl","quoteAudioUrl"].forEach(function (k) { if (msg[k] && !old[k]) old[k] = msg[k]; });
-        if (msg.mentionUids && msg.mentionUids.length) old.mentionUids = msg.mentionUids;
-        old.mentionMe = old.mentionMe || msg.mentionMe || getMentionNoticeType(old) !== "";
-        sanitizeQuoteFields(old);
-        touchMsg(old);
-        updateSeq(old.seq);
+      var old = findExistingMessage(msg);
+      if (old) {
+        mergeServerIntoLocal(old, msg);
         touchedMessages.push(old);
         changed = true;
         return;
       }
-      if (!msg.seq && !msg.id) {
-        var sk = textDedupKey(msg, 10000);
-        if (seenSoft[sk]) return;
-        seenSoft[sk] = true;
-      }
       state.messages.push(msg);
       touchedMessages.push(msg);
-      state.msgMap[msg.id] = msg;
+      registerMsgAliases(msg);
       updateSeq(msg.seq);
+      if (!firstUnreadCandidate && opts.markUnreadNew && Number(state.entryCacheNewestSeq || 0) > 0 && Number(msg.seq || 0) > Number(state.entryCacheNewestSeq || 0)) firstUnreadCandidate = msg;
       if (opts.notify !== false && !msg.mine && getMentionNoticeType(msg)) setTimeout(function () { pushMentionNotice(msg); }, 0);
       changed = true;
     });
     if (!changed) return;
     state.messages.sort(function (a, b) { return (a.ts || 0) - (b.ts || 0); });
+    if (firstUnreadCandidate && !state.unreadDividerMsgId) state.unreadDividerMsgId = firstUnreadCandidate.id;
     if (state.messages.length > MAX_MEMORY) {
       var removed = state.messages.splice(0, state.messages.length - MAX_MEMORY);
-      removed.forEach(function (m) { delete state.msgMap[m.id]; });
+      removed.forEach(function (m) { unregisterMsgAliases(m); });
     }
     queueResolveUsersFromMessages(touchedMessages);
     saveCacheSoon();
@@ -1050,6 +1123,9 @@
           saveCacheDb();
         }
       }
+      state.entryCacheNewestSeq = Number(state.newestSeq || 0);
+      state.entryCacheLastTs = state.messages.length ? Number(state.messages[state.messages.length - 1].ts || 0) : 0;
+      state.unreadDividerMsgId = "";
     } catch (e) { warn("load-cache-db", e); }
   }
   function saveCacheSoon() {
@@ -1394,6 +1470,8 @@
     byId("cp-topic-msg-list").addEventListener("click", onMsgListClick);
     bindLongPress(byId("cp-topic-msg-list"));
     byId("cp-topic-context-overlay").addEventListener("click", function (e) { if (e.target === this) hideContextMenu(); });
+    var atBanner = byId("cp-topic-at-banner");
+    if (atBanner) atBanner.addEventListener("click", function () { scrollToMessageId(atBanner.getAttribute("data-mid") || ""); });
     byId("cp-topic-context-menu").addEventListener("click", onContextMenuClick);
     byId("cp-topic-preview-mask").addEventListener("click", function (e) { if (e.target === this || e.target.closest("[data-act='close-preview']")) closePreview(); });
 
@@ -1638,13 +1716,19 @@
     var keys = [], nodes = {}, prev = null;
     for (var i = 0; i < msgs.length; i++) {
       var m = msgs[i], next = msgs[i + 1] || null;
-      if (!m.mine && (!m.username || /^用户\d+$/.test(m.username))) queueResolveUsers([m.uid]);
       if (shouldShowTimeSep(prev, m)) {
         var sepKey = "sep:" + formatTimeDivider(m.ts);
         var sep = existing[sepKey] || document.createElement("div");
         sep.className = "cp-time-sep"; sep.setAttribute("data-key", sepKey);
         if (sep.getAttribute("data-hash") !== sepKey) { sep.innerHTML = '<span>' + esc(formatTimeDivider(m.ts)) + '</span>'; sep.setAttribute("data-hash", sepKey); }
         keys.push(sepKey); nodes[sepKey] = sep;
+      }
+      if (state.unreadDividerMsgId && String(m.id) === String(state.unreadDividerMsgId)) {
+        var unreadKey = "unread:" + state.unreadDividerMsgId;
+        var unreadSep = existing[unreadKey] || document.createElement("div");
+        unreadSep.className = "cp-unread-sep"; unreadSep.setAttribute("data-key", unreadKey);
+        if (unreadSep.getAttribute("data-hash") !== unreadKey) { unreadSep.innerHTML = '<span>以下是新消息</span>'; unreadSep.setAttribute("data-hash", unreadKey); }
+        keys.push(unreadKey); nodes[unreadKey] = unreadSep;
       }
       var key = "msg:" + m.id;
       var node = existing[key] || document.createElement("div");
@@ -1822,7 +1906,7 @@
       var raw = normalizeHistory(json);
       if (!raw.length || raw.length < CONFIG.historyLimit) state.hasNoMore = true;
       if (loadMore) state.renderLimit = Math.min(MAX_RENDER_LIMIT, state.renderLimit + RENDER_STEP);
-      addMessages(raw.map(function (m) { return msgFromWk(m); }), { scroll: loadMore ? "prepend" : (state.stickToBottom ? "bottom" : "keep"), notify: false });
+      addMessages(raw.map(function (m) { return msgFromWk(m); }), { scroll: loadMore ? "prepend" : (state.stickToBottom ? "bottom" : "keep"), notify: false, markUnreadNew: !loadMore });
       state.lastHistoryAt = Date.now();
     } catch (e) { warn("history", e); }
     finally {
@@ -2302,30 +2386,65 @@
   }
   function hideContextMenu() { byId("cp-topic-context-overlay").hidden = true; state.contextMsg = null; }
 
+  function addNoticeItem(item) {
+    if (!item || !item.id) return false;
+    var id = String(item.id);
+    if ((state.mentionNotices || []).some(function (n) { return String(n.id) === id; })) return false;
+    state.mentionNotices = [item].concat(state.mentionNotices || []).slice(0, 50);
+    if (item.type === "reply") state.replyNotices = [item].concat(state.replyNotices || []).slice(0, 50);
+    else state.atNotices = [item].concat(state.atNotices || []).slice(0, 50);
+    return true;
+  }
   function pushMentionNotice(msg) {
     var type = getMentionNoticeType(msg);
     if (!type || !msg || !msg.id) return;
-    var id = String(msg.id);
-    if ((state.mentionNotices || []).some(function (n) { return String(n.id) === id; })) return;
     var who = displayNameForMessage(msg) || msg.username || "有人";
-    state.mentionNotices = [{ id: id, type: type, text: type === "reply" ? (who + " 回复了你") : (who + " @了你"), ts: Date.now() }].concat(state.mentionNotices || []).slice(0, 30);
-    toast(state.mentionNotices[0].text); updateMentionBanner();
+    var item = { id: String(msg.id), type: type, text: type === "reply" ? (who + " 回复了你") : (who + " @了你"), ts: Date.now() };
+    if (!addNoticeItem(item)) return;
+    toast(item.text); updateMentionBanner();
     try { if (navigator.vibrate) navigator.vibrate([35, 45, 35]); } catch (_) {}
   }
   function updateMentionBanner() {
     var banner = byId("cp-topic-at-banner"), txt = byId("cp-topic-at-banner-text"), n = (state.mentionNotices || [])[0];
     if (!banner || !txt) return;
     if (!n) { banner.hidden = true; return; }
-    banner.setAttribute("data-mid", n.id); txt.textContent = (state.mentionNotices.length > 1 ? (state.mentionNotices.length + "条提醒 · ") : "") + n.text; banner.hidden = false;
+    var atCount = (state.atNotices || []).length;
+    var replyCount = (state.replyNotices || []).length;
+    var parts = [];
+    if (replyCount) parts.push(replyCount + "条回复我");
+    if (atCount) parts.push(atCount + "条@我");
+    banner.setAttribute("data-mid", n.id);
+    txt.textContent = (parts.length ? (parts.join(" · ") + " · ") : "") + n.text;
+    banner.hidden = false;
   }
   function scrollToMessageId(mid) {
-    var safe = String(mid || "").replace(/"/g, '\\"');
-    var row = document.querySelector('#cp-topic-msg-list .cp-row[data-mid="' + safe + '"]');
-    if (!row) return toast("这条消息还没加载到屏幕");
-    row.scrollIntoView({ behavior: "smooth", block: "center" });
-    var bubble = row.querySelector(".cp-bubble");
-    if (bubble) { bubble.classList.add("cp-mention-me"); setTimeout(function () { bubble.classList.remove("cp-mention-me"); }, 1600); }
-    state.mentionNotices = (state.mentionNotices || []).filter(function (n) { return String(n.id) !== String(mid); }); updateMentionBanner();
+    mid = String(mid || "").trim();
+    if (!mid) return;
+    var msg = findMsgByAnyId(mid);
+    if (msg && state.messages.indexOf(msg) >= 0) {
+      state.renderLimit = Math.min(MAX_RENDER_LIMIT, Math.max(state.renderLimit, state.messages.length));
+      queueRender("keep");
+      setTimeout(function () {
+        var row = null;
+        var rows = document.querySelectorAll("#cp-topic-msg-list .cp-row");
+        Array.prototype.some.call(rows, function (el) { if (el.getAttribute("data-mid") === String(msg.id)) { row = el; return true; } return false; });
+        if (!row) return toast("这条消息还没加载到屏幕");
+        row.scrollIntoView({ behavior: "smooth", block: "center" });
+        var bubble = row.querySelector(".cp-bubble");
+        if (bubble) { bubble.classList.add("cp-msg-highlight"); setTimeout(function () { bubble.classList.remove("cp-msg-highlight"); }, 1800); }
+        markNoticeDone(msg.id);
+      }, 80);
+      return;
+    }
+    toast("正在加载引用消息...");
+    fetchHistory(true).then(function () { var m2 = findMsgByAnyId(mid); if (m2) scrollToMessageId(m2.id); else toast("暂时找不到这条消息"); }).catch(function () { toast("暂时找不到这条消息"); });
+  }
+  function markNoticeDone(mid) {
+    mid = String(mid || "");
+    state.mentionNotices = (state.mentionNotices || []).filter(function (n) { return String(n.id) !== mid; });
+    state.atNotices = (state.atNotices || []).filter(function (n) { return String(n.id) !== mid; });
+    state.replyNotices = (state.replyNotices || []).filter(function (n) { return String(n.id) !== mid; });
+    updateMentionBanner();
   }
   function fetchRemoteNotices() {
     if (!CONFIG.notifyListUrl || !state.topic || !state.uid) return;
@@ -2336,9 +2455,8 @@
         if (j.version != null) state.notifyVersion = Math.max(Number(state.notifyVersion || 0), Number(j.version || 0));
         (Array.isArray(j.list) ? j.list : []).forEach(function (n) {
           var id = String(n.message_id || n.msg_id || n.client_msg_no || n.id || Math.random());
-          if ((state.mentionNotices || []).some(function (x) { return String(x.id) === id; })) return;
-          state.mentionNotices = [{ id: id, type: n.type || "mention", text: n.text || ((n.from_name || "有人") + " @了你"), ts: Date.now() }].concat(state.mentionNotices || []).slice(0, 30);
-          updateMentionBanner(); toast(state.mentionNotices[0].text);
+          var item = { id: id, type: n.type || "mention", text: n.text || ((n.from_name || "有人") + " @了你"), ts: Date.now() };
+          if (addNoticeItem(item)) { updateMentionBanner(); toast(item.text); }
         });
       }).catch(function (e) { warn("remote-notices", e); });
   }
@@ -2437,10 +2555,10 @@
   async function mount() {
     if (state.mounted || !isTargetTopic()) return;
     state.topic = getTopicInfo(); state.channelId = channelIdOf(state.topic);
-    state.uid = ""; state.messages = []; state.msgMap = {}; state.newestSeq = 0; state.oldestSeq = 0; state.hasNoMore = false; state.loadingHistory = false; state.unread = 0; state.wkReady = false; state.connectStarted = false; state.renderLimit = INITIAL_RENDER_LIMIT; state.mentionNotices = []; state.pendingRenderMode = ""; state.userBatchInflight = {}; state.mergedUserCache = {}; state.avatarHashCache = {}; state.offlineInflight = false;
+    state.uid = ""; state.messages = []; state.msgMap = {}; state.msgStableMap = {}; state.newestSeq = 0; state.oldestSeq = 0; state.hasNoMore = false; state.loadingHistory = false; state.unread = 0; state.wkReady = false; state.connectStarted = false; state.renderLimit = INITIAL_RENDER_LIMIT; state.mentionNotices = []; state.atNotices = []; state.replyNotices = []; state.unreadDividerMsgId = ""; state.entryCacheNewestSeq = 0; state.entryCacheLastTs = 0; state.pendingRenderMode = ""; state.userBatchInflight = {}; state.mergedUserCache = {}; state.avatarHashCache = {}; state.offlineInflight = false;
     state.cfg = normalizeConfig(await loadJSON(KEY_CFG, DEFAULT_CFG)); state.bg = await loadJSON(KEY_BG, DEFAULT_BG);
     await loadUserCacheLocal();
-    injectStyle(); injectRoot(); bindUI(); applyBackground(); renderRecBars(); document.body.classList.add(BODY_CLASS);
+    injectStyle(); injectRoot(); bindUI(); applyBackground(); renderRecBars(); document.body.classList.add(BODY_CLASS, "cp-topic-chat-mounted");
     state.mounted = true; initLazyObserver(); updateViewport(); updateFooterHeight(); updateHeader();
     await loadCacheDbAndMerge(); queueResolveUsersFromMessages(state.messages); queueRender("bottom");
     try {
@@ -2456,15 +2574,18 @@
     if (!state.mounted) return;
     saveCacheDb(); stopPresence(); stopNotifyPolling();
     if (state.uiAbort) { try { state.uiAbort.abort(); } catch (_) {} state.uiAbort = null; }
-    clearTimeout(state.userBatchTimer); if (state.lazyObserver) state.lazyObserver.disconnect(); state.lazyObserver = null;
-    try { state.audio.pause(); } catch (_) {}
+    clearTimeout(state.userBatchTimer); clearTimeout(cacheTimer); clearTimeout(footerTimer); clearTimeout(state.bootTimer);
+    state.userBatchPending = {}; state.userBatchInflight = {}; state.pendingRenderMode = ""; state.renderPending = false;
+    if (state.lazyObserver) state.lazyObserver.disconnect(); state.lazyObserver = null;
+    try { state.audio.pause(); state.audio.currentTime = 0; } catch (_) {}
+    if (state.currentAudioEl) { try { state.currentAudioEl.classList.remove("playing"); } catch (_) {} state.currentAudioEl = null; }
     try {
       if (state.rec.mediaRecorder && state.rec.mediaRecorder.state !== "inactive") { state.rec.shouldSend = false; state.rec.mediaRecorder.stop(); }
       if (state.rec.stream) state.rec.stream.getTracks().forEach(function (t) { t.stop(); });
     } catch (_) {}
     clearInterval(state.rec.timer); state.rec.timer = null;
     var root = byId(ROOT_ID); if (root) root.remove();
-    document.body.classList.remove(BODY_CLASS, "cp-topic-chat-on-v13", "cp-topic-chat-on-v14", "cp-topic-chat-on-v18", "cp-topic-chat-on-v20", "cp-topic-has-bg");
+    document.body.classList.remove(BODY_CLASS, "cp-topic-chat-on-v13", "cp-topic-chat-on-v14", "cp-topic-chat-on-v18", "cp-topic-chat-on-v20", "cp-topic-chat-mounted", "cp-topic-has-bg");
     state.mounted = false;
   }
   function boot() {
@@ -2484,7 +2605,7 @@
 
   window.cpTopicChatDebug = {
     state: state,
-    version: "v29-idb-sdk-stable",
+    version: "v32-chat-polish",
     renderNow: function () { queueRender("keep"); },
     forceBottom: forceBottom,
     parseUploadUrl: parseUploadUrl
