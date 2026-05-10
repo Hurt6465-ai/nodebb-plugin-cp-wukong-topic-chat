@@ -1,5 +1,5 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v35-stable-from-v32
+ * CP NodeBB Topic WuKong Chat - CID 7 - v36-notice-reply-fix
  * 重点改动：
  * - 保留板块 7 视觉排序 IIFE，但不轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
@@ -15,7 +15,7 @@
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V35StableFromV32Inited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V36NoticeReplyFixInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -184,6 +184,7 @@
     entryCacheLastTs: 0,
     notifyVersion: 0,
     notifyPollTimer: null,
+    visibleNoticeTimer: null,
     presenceTimer: null,
     presencePollTimer: null,
     userCache: {},
@@ -215,12 +216,12 @@
   };
 
   function warn(scope, err) {
-    try { console.warn("[cp-topic-wukong-v35-stable-from-v32][" + scope + "]", err); } catch (_) {}
+    try { console.warn("[cp-topic-wukong-v36-notice-reply-fix][" + scope + "]", err); } catch (_) {}
   }
 
   function log(scope, data) {
     if (!CONFIG.debug) return;
-    try { console.log("[cp-topic-wukong-v35-stable-from-v32][" + scope + "]", data || ""); } catch (_) {}
+    try { console.log("[cp-topic-wukong-v36-notice-reply-fix][" + scope + "]", data || ""); } catch (_) {}
   }
 
   function byId(id) { return document.getElementById(id); }
@@ -1477,6 +1478,7 @@
         state.stickToBottom = isAtBottom();
         if (state.stickToBottom) state.unread = 0;
         updateFab();
+        scheduleMarkVisibleNoticesDone();
         if (main.scrollTop < 90 && !state.loadingHistory && !state.hasNoMore) {
           if (state.renderLimit < Math.min(MAX_RENDER_LIMIT, state.messages.length)) {
             state.renderLimit = Math.min(MAX_RENDER_LIMIT, state.renderLimit + RENDER_STEP);
@@ -1770,20 +1772,6 @@
     else if (mode === "keep") { if (wasBottom || state.stickToBottom) requestAnimationFrame(forceBottom); else main.scrollTop = oldTop; }
     observeLazyElements(); updateFab(); updateFooterHeight(); markVisibleNoticesDone();
   }
-  function markVisibleNoticesDone() {
-    var main = byId("cp-topic-main");
-    if (!main || !(state.mentionNotices || []).length) return;
-    var box = main.getBoundingClientRect();
-    var rows = document.querySelectorAll("#cp-topic-msg-list .cp-row");
-    Array.prototype.forEach.call(rows, function (row) {
-      var mid = row.getAttribute("data-mid") || "";
-      if (!mid) return;
-      if (!(state.mentionNotices || []).some(function (n) { return String(n.id) === String(mid); })) return;
-      var r = row.getBoundingClientRect();
-      var visible = r.bottom > box.top + 20 && r.top < box.bottom - 20;
-      if (visible) markNoticeDone(mid);
-    });
-  }
   function initLazyObserver() {
     if (state.lazyObserver) state.lazyObserver.disconnect();
     if (!("IntersectionObserver" in window)) return;
@@ -1999,36 +1987,84 @@
       var channel = new window.wk.Channel(state.channelId, CONFIG.channelType);
       var mentionUids = (local.mentionUids || extractMentionUids(originalText) || []).map(String).filter(Boolean);
       var content = new window.wk.MessageText(textToSend);
-      var rawEncode = content.encode && content.encode.bind(content);
-      if (rawEncode) {
-        content.encode = function () {
-          var p = rawEncode();
-          try {
-            var obj = typeof p === "string" ? JSON.parse(p) : (p || {});
-            obj.username = getMyName();
-            if (textToSend !== originalText) obj.originalText = originalText;
-            if (parsed.kind !== "text") obj.cpType = parsed.kind;
-            if (parsed.mediaUrl) obj.mediaUrl = parsed.mediaUrl;
-            if (parsed.audioUrl) obj.audioUrl = parsed.audioUrl;
-            if (opts.duration) obj.duration = opts.duration;
-            obj.topic_tid = state.topic && state.topic.tid ? String(state.topic.tid) : "";
-            obj.topic_title = state.topic && state.topic.title ? String(state.topic.title) : "";
-            if (local.quote) {
-              obj.quote = local.quote; obj.quote_text = local.quote; obj.quoteText = local.quote;
-              obj.quoteUser = local.quoteUser || ""; obj.replyUser = local.quoteUser || "";
-              obj.quote_uid = local.quoteUid || ""; obj.quoteUid = local.quoteUid || ""; obj.reply_to_uid = local.quoteUid || ""; obj.replyToUid = local.quoteUid || "";
-              obj.quote_msg_id = local.quoteMsgId || ""; obj.quoteMsgId = local.quoteMsgId || ""; obj.reply_to_msg_id = local.quoteMsgId || ""; obj.replyToMsgId = local.quoteMsgId || "";
-              obj.quote_type = local.quoteType || "text"; obj.quoteType = local.quoteType || "text";
-              obj.quote_media_url = local.quoteMediaUrl || ""; obj.quoteMediaUrl = local.quoteMediaUrl || ""; obj.quote_audio_url = local.quoteAudioUrl || ""; obj.quoteAudioUrl = local.quoteAudioUrl || "";
-              obj.reply = { id: local.quoteMsgId || "", messageId: local.quoteMsgId || "", clientMsgNo: local.quoteMsgId || "", uid: local.quoteUid || "", user: local.quoteUser || "", text: local.quote || "", type: local.quoteType || "text", mediaUrl: local.quoteMediaUrl || "", audioUrl: local.quoteAudioUrl || "" };
-            }
-            if (mentionUids.length) {
-              obj.mention_uids = mentionUids; obj.mentionUids = mentionUids; obj.at_uids = mentionUids; obj.atUsers = mentionUids; obj.at = mentionUids; obj.is_at = 1; obj.mention_type = "users";
-            }
-            return typeof p === "string" ? JSON.stringify(obj) : obj;
-          } catch (_) { return p; }
-        };
+      function decorateOutgoingPayload(obj) {
+        obj = obj && typeof obj === "object" ? obj : {};
+        obj.text = obj.text || textToSend;
+        obj.content = obj.content || textToSend;
+        obj.username = getMyName();
+        if (textToSend !== originalText) obj.originalText = originalText;
+        if (parsed.kind !== "text") obj.cpType = parsed.kind;
+        if (parsed.mediaUrl) obj.mediaUrl = parsed.mediaUrl;
+        if (parsed.audioUrl) obj.audioUrl = parsed.audioUrl;
+        if (opts.duration) obj.duration = opts.duration;
+        obj.topic_tid = state.topic && state.topic.tid ? String(state.topic.tid) : "";
+        obj.topic_title = state.topic && state.topic.title ? String(state.topic.title) : "";
+        if (local.quote || local.quoteMsgId || local.quoteUid) {
+          obj.quote = local.quote || "[引用消息]";
+          obj.quote_text = local.quote || "[引用消息]";
+          obj.quoteText = local.quote || "[引用消息]";
+          obj.quoteUser = local.quoteUser || "";
+          obj.replyUser = local.quoteUser || "";
+          obj.quote_uid = local.quoteUid || "";
+          obj.quoteUid = local.quoteUid || "";
+          obj.reply_to_uid = local.quoteUid || "";
+          obj.replyToUid = local.quoteUid || "";
+          obj.quote_msg_id = local.quoteMsgId || "";
+          obj.quoteMsgId = local.quoteMsgId || "";
+          obj.reply_to_msg_id = local.quoteMsgId || "";
+          obj.replyToMsgId = local.quoteMsgId || "";
+          obj.quote_type = local.quoteType || "text";
+          obj.quoteType = local.quoteType || "text";
+          obj.reply_type = local.quoteType || "text";
+          obj.replyType = local.quoteType || "text";
+          obj.quote_media_url = local.quoteMediaUrl || "";
+          obj.quoteMediaUrl = local.quoteMediaUrl || "";
+          obj.quote_audio_url = local.quoteAudioUrl || "";
+          obj.quoteAudioUrl = local.quoteAudioUrl || "";
+          obj.reply = {
+            id: local.quoteMsgId || "",
+            messageId: local.quoteMsgId || "",
+            clientMsgNo: local.quoteMsgId || "",
+            uid: local.quoteUid || "",
+            userId: local.quoteUid || "",
+            user: local.quoteUser || "",
+            username: local.quoteUser || "",
+            displayname: local.quoteUser || "",
+            text: local.quote || "[引用消息]",
+            preview: local.quote || "[引用消息]",
+            type: local.quoteType || "text",
+            mediaUrl: local.quoteMediaUrl || "",
+            audioUrl: local.quoteAudioUrl || ""
+          };
+        }
+        if (mentionUids.length) {
+          obj.mention_uids = mentionUids;
+          obj.mentionUids = mentionUids;
+          obj.at_uids = mentionUids;
+          obj.atUsers = mentionUids;
+          obj.at = mentionUids;
+          obj.is_at = 1;
+          obj.mention_type = "users";
+        }
+        return obj;
       }
+      content.text = textToSend;
+      content.content = textToSend;
+      content.cpExtra = decorateOutgoingPayload({});
+      content.extra = content.cpExtra;
+      content.payload = content.cpExtra;
+      var rawEncode = content.encode && content.encode.bind(content);
+      content.encode = function () {
+        var p = rawEncode ? rawEncode() : { type: 1, content: textToSend, text: textToSend };
+        try {
+          var obj = typeof p === "string" ? JSON.parse(p) : (p || {});
+          obj = decorateOutgoingPayload(obj);
+          return typeof p === "string" ? JSON.stringify(obj) : obj;
+        } catch (err) {
+          warn("encode-payload", err);
+          return JSON.stringify(decorateOutgoingPayload({ type: 1, content: textToSend, text: textToSend }));
+        }
+      };
       var sent = window.wk.WKSDK.shared().chatManager.send(content, channel);
       local.sending = false;
       if (sent) {
@@ -2489,11 +2525,26 @@
     if (!ids.length || !CONFIG.notifyListUrl) return;
     try { bridgePost(CONFIG.notifyListUrl.replace(/\/list$/, "/done"), { ids: ids }, 8000).catch(function () {}); } catch (_) {}
   }
+  function noticeMatchesMid(n, mid) {
+    mid = String(mid || "");
+    if (!n || !mid) return false;
+    var candidates = [n.id, n.messageId, n.clientMsgNo, n.msgId, n.message_id, n.client_msg_no].map(function (x) { return String(x || ""); }).filter(Boolean);
+    if (candidates.indexOf(mid) >= 0) return true;
+    var rowMsg = findMsgByAnyId(mid);
+    for (var i = 0; i < candidates.length; i++) {
+      var m = findMsgByAnyId(candidates[i]);
+      if (m && rowMsg && String(m.id) === String(rowMsg.id)) return true;
+      if (m && String(m.id) === mid) return true;
+      if (rowMsg && (String(rowMsg.messageId || "") === candidates[i] || String(rowMsg.clientMsgNo || "") === candidates[i])) return true;
+    }
+    return false;
+  }
   function markNoticeDone(mid) {
     mid = String(mid || "");
+    if (!mid) return;
     var remoteIds = [];
     function keep(n) {
-      var hit = String(n.id || "") === mid || String(n.messageId || "") === mid || String(n.clientMsgNo || "") === mid;
+      var hit = noticeMatchesMid(n, mid);
       if (hit && n.remoteId) remoteIds.push(String(n.remoteId));
       return !hit;
     }
@@ -2502,6 +2553,31 @@
     state.replyNotices = (state.replyNotices || []).filter(keep);
     updateMentionBanner();
     remoteNoticeDone(remoteIds);
+  }
+  function rowMostlyVisible(row, viewport) {
+    if (!row || !viewport) return false;
+    var a = row.getBoundingClientRect();
+    var b = viewport.getBoundingClientRect();
+    var top = Math.max(a.top, b.top);
+    var bottom = Math.min(a.bottom, b.bottom);
+    var visible = Math.max(0, bottom - top);
+    return visible >= Math.min(48, Math.max(24, a.height * 0.45));
+  }
+  function scheduleMarkVisibleNoticesDone() {
+    if (!state.mounted || !(state.mentionNotices || []).length) return;
+    clearTimeout(state.visibleNoticeTimer);
+    state.visibleNoticeTimer = setTimeout(markVisibleNoticesDone, 450);
+  }
+  function markVisibleNoticesDone() {
+    if (!state.mounted || !(state.mentionNotices || []).length) return;
+    var main = byId("cp-topic-main");
+    if (!main) return;
+    var rows = document.querySelectorAll("#cp-topic-msg-list .cp-row[data-mid]");
+    Array.prototype.forEach.call(rows, function (row) {
+      if (!rowMostlyVisible(row, main)) return;
+      var mid = row.getAttribute("data-mid") || "";
+      if (mid) markNoticeDone(mid);
+    });
   }
   function fetchRemoteNotices() {
     if (!CONFIG.notifyListUrl || !state.topic || !state.uid) return;
@@ -2518,7 +2594,7 @@
           var item = { id: id, messageId: rawId, clientMsgNo: String(n.client_msg_no || ""), remoteId: String(n.id || ""), type: typ, text: n.text || ((n.from_name || "有人") + (typ === "reply" ? " 回复了你" : " @了你")), ts: Date.now() };
           if (addNoticeItem(item)) { updateMentionBanner(); toast(item.text); }
         });
-      }).catch(function (e) { warn("remote-notices", e); });
+      }).then(function () { scheduleMarkVisibleNoticesDone(); }).catch(function (e) { warn("remote-notices", e); });
   }
   function startNotifyPolling() {
     stopNotifyPolling();
@@ -2646,7 +2722,7 @@
     if (!state.mounted) { var r0 = byId(ROOT_ID); if (r0) r0.remove(); document.body.classList.remove("cp-topic-chat-mounted"); return; }
     saveCacheDb(); stopPresence(); stopNotifyPolling();
     if (state.uiAbort) { try { state.uiAbort.abort(); } catch (_) {} state.uiAbort = null; }
-    clearTimeout(state.userBatchTimer); clearTimeout(cacheTimer); clearTimeout(footerTimer); clearTimeout(state.bootTimer);
+    clearTimeout(state.userBatchTimer); clearTimeout(state.visibleNoticeTimer); clearTimeout(cacheTimer); clearTimeout(footerTimer); clearTimeout(state.bootTimer);
     state.userBatchPending = {}; state.userBatchInflight = {}; state.pendingRenderMode = ""; state.renderPending = false;
     if (state.lazyObserver) state.lazyObserver.disconnect(); state.lazyObserver = null;
     try { state.audio.pause(); state.audio.currentTime = 0; } catch (_) {}
@@ -2677,7 +2753,7 @@
 
   window.cpTopicChatDebug = {
     state: state,
-    version: "v35-stable-from-v32",
+    version: "v36-notice-reply-fix",
     renderNow: function () { queueRender("keep"); },
     forceBottom: forceBottom,
     parseUploadUrl: parseUploadUrl
