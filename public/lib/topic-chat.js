@@ -1,16 +1,17 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v26-perf
+ * CP NodeBB Topic WuKong Chat - CID 7 - v27-perf-stable
  * 重点改动：
  * - 去掉板块排序 IIFE，不再轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
  * - DOM 节点复用：data-key 定位节点，data-hash 判断是否需要更新。
  * - 默认只渲染最近 140 条；上滑逐步扩容到 260 条。
- * - CSS 继续使用原第二段 class，一般不需要改 CSS。
+ * - 保留媒体压缩、背景压缩、活动触达、批量用户资料缓存。
+ * - 国旗/在线状态稳定版：批量接口优先，合并本地资料，头像资料进入增量渲染 hash。
  */
 (function () {
   "use strict";
 
-  var GLOBAL_KEY = "__cpTopicWukongCid7V26PerfInited";
+  var GLOBAL_KEY = "__cpTopicWukongCid7V27PerfStableInited";
   if (window[GLOBAL_KEY]) return;
   window[GLOBAL_KEY] = true;
 
@@ -32,18 +33,19 @@
     presenceUrl: "/bridge/topic-presence",
     notifyUrl: "/bridge/topic-notify",
     notifyListUrl: "/bridge/topic-notify/list",
+    activityTouchUrl: "/bridge/topic-activity/touch",
     usersBatchUrl: "/nodebb-users",
     debug: false
   };
 
   var ROOT_ID = "cp-topic-chat-root";
   var BODY_CLASS = "cp-topic-chat-on-v20";
-  var DB_NAME = "CP_TOPIC_WUKONG_CACHE_V26_PERF";
+  var DB_NAME = "CP_TOPIC_WUKONG_CACHE_V27_PERF_STABLE";
   var STORE = "topics";
-  var LS_PREFIX = "cp_topic_wk_cache_v26_perf_";
-  var KEY_CFG = "cp_topic_wk_cfg_v26_perf";
-  var KEY_BG = "cp_topic_wk_bg_v26_perf";
-  var KEY_USER_CACHE = "cp_topic_wk_user_cache_v30";
+  var LS_PREFIX = "cp_topic_wk_cache_v27_perf_stable_";
+  var KEY_CFG = "cp_topic_wk_cfg_v27_perf_stable";
+  var KEY_BG = "cp_topic_wk_bg_v27_perf_stable";
+  var KEY_USER_CACHE = "cp_topic_wk_user_cache_v31_profile";
 
   var MAX_CACHE = 360;
   var MAX_MEMORY = 900;
@@ -52,6 +54,26 @@
   var MAX_RENDER_LIMIT = 260;
   var BOTTOM_THRESHOLD = 120;
   var PENDING_TTL = 60000;
+
+  var IMAGE_CONFIG = {
+    maxSide: 1440,
+    maxSizeMB: 0.45,
+    quality: 0.6,
+    minCompressBytes: 120 * 1024,
+    useWebp: true
+  };
+
+  var VIDEO_CONFIG = {
+    maxSizeThreshold: 30 * 1024 * 1024,
+    maxDuration: 60,
+    maxWidth: 720,
+    fps: 24,
+    videoBitsPerSecond: 900000,
+    audioBitsPerSecond: 64000
+  };
+
+  var USER_CACHE_TTL_MS = 30 * 24 * 3600 * 1000;
+  var USER_CACHE_STALE_REFRESH_MS = 12 * 3600 * 1000;
 
   var LANG_LIST = [
     { n: "中文", code: "zh-CN", f: "🇨🇳" },
@@ -150,6 +172,7 @@
     audio: new Audio(),
     currentAudioEl: null,
     lazyObserver: null,
+    encodeSupport: {},
     previewOpen: false,
     rec: {
       mediaRecorder: null,
@@ -164,7 +187,7 @@
   };
 
   function warn(scope, err) {
-    try { console.warn("[cp-topic-wukong-v26-perf][" + scope + "]", err); } catch (_) {}
+    try { console.warn("[cp-topic-wukong-v27-perf-stable][" + scope + "]", err); } catch (_) {}
   }
   function byId(id) { return document.getElementById(id); }
   function now() { return Date.now(); }
@@ -300,32 +323,124 @@
     if (!u) return fallback || "用户";
     return u.displayname || u.fullname || u.name || u.username || fallback || (u.uid ? "用户" + u.uid : "用户");
   }
+  function normalizeUserField(u, keys) {
+    u = u || {};
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (u[k] !== undefined && u[k] !== null && String(u[k]).trim() !== "") return u[k];
+    }
+    return "";
+  }
+  function normalizeUserProfile(raw, uid) {
+    raw = raw || {};
+    uid = String(uid || raw.uid || "");
+    return {
+      loaded: true,
+      uid: uid,
+      username: normalizeUserField(raw, ["username", "userslug", "name"]) || (uid ? "用户" + uid : "用户"),
+      displayname: displayNameFromUser(raw, uid ? "用户" + uid : "用户"),
+      picture: normalizeUserField(raw, ["picture", "uploadedpicture", "uploadedPicture", "avatar"]),
+      icontext: normalizeUserField(raw, ["icontext", "icon:text", "iconText"]),
+      iconbgColor: normalizeUserField(raw, ["iconbgColor", "icon:bgColor", "iconBgColor"]) || "#72a5f2",
+      userslug: normalizeUserField(raw, ["userslug", "slug", "username"]),
+      status: normalizeUserField(raw, ["status", "userStatus", "presence", "onlineStatus"]),
+      language_flag: normalizeUserField(raw, ["language_flag", "languageFlag", "countryFlag", "country_flag", "flag", "nationality", "country", "localeCountry"]),
+      online: userIsOnline(raw),
+      profileVersion: Number(raw.profileVersion || raw.version || 0) || Date.now(),
+      cacheAt: Date.now(),
+      cacheExpiresAt: Date.now() + USER_CACHE_TTL_MS
+    };
+  }
+  function userHasProfileBadges(u) {
+    return !!(u && (u.language_flag || u.languageFlag || u.countryFlag || u.country_flag || u.flag || u.nationality || u.country || u.status || u.online === true || u.isOnline === true));
+  }
+  function mergeUserObjects(local, cached) {
+    local = local || {};
+    cached = cached || {};
+    var out = mergeDeep(mergeDeep({}, local), cached);
+    // 头像/昵称优先使用 NodeBB 当前页面最新值；国旗/在线状态优先使用批量接口/缓存，因为 topic 内嵌 user 经常缺自定义字段。
+    if (local.picture || local.uploadedpicture) out.picture = local.picture || local.uploadedpicture;
+    if (local.username) out.username = local.username;
+    if (local.displayname || local.fullname || local.name) out.displayname = local.displayname || local.fullname || local.name;
+    if (local.userslug) out.userslug = local.userslug;
+    if (local.icontext || local["icon:text"]) out.icontext = local.icontext || local["icon:text"];
+    if (local.iconbgColor || local["icon:bgColor"]) out.iconbgColor = local.iconbgColor || local["icon:bgColor"];
+    if (!userHasProfileBadges(cached) && userHasProfileBadges(local)) {
+      out.language_flag = normalizeUserField(local, ["language_flag", "languageFlag", "countryFlag", "country_flag", "flag", "nationality", "country", "localeCountry"]);
+      out.status = normalizeUserField(local, ["status", "userStatus", "presence", "onlineStatus"]);
+      out.online = userIsOnline(local);
+    }
+    return out;
+  }
+  function getMergedUserByUid(uid) {
+    uid = String(uid || "");
+    return mergeUserObjects(getAjaxUserByUid(uid) || {}, state.userCache[uid] || {});
+  }
   function displayNameForMessage(msg) {
     if (!msg) return "用户";
-    var u = getAjaxUserByUid(msg.uid) || state.userCache[String(msg.uid || "")];
+    var u = getMergedUserByUid(msg.uid);
     return displayNameFromUser(u, msg.username || (msg.uid ? "用户" + msg.uid : "用户"));
   }
   function userIsOnline(u) {
     if (!u) return false;
     var s = String(u.status || u.userStatus || u.presence || u.onlineStatus || "").toLowerCase();
     if (s === "online") return true;
-    if (s === "offline" || s === "invisible") return false;
+    if (s === "offline" || s === "invisible" || s === "away") return false;
     return u.online === true || u.isOnline === true;
+  }
+  function flagEmojiFromLanguageFlag(v) {
+    v = String(v || "").trim();
+    if (!v) return "";
+    var lower = v.toLowerCase();
+    var map = {
+      "缅甸": "🇲🇲", "缅甸语": "🇲🇲", "မြန်မာ": "🇲🇲", "မြန်မာစာ": "🇲🇲", "myanmar": "🇲🇲", "burma": "🇲🇲", "my": "🇲🇲", "my-mm": "🇲🇲",
+      "中国": "🇨🇳", "中文": "🇨🇳", "汉语": "🇨🇳", "zh": "🇨🇳", "zh-cn": "🇨🇳", "china": "🇨🇳",
+      "台湾": "🇹🇼", "繁体中文": "🇹🇼", "zh-tw": "🇹🇼", "taiwan": "🇹🇼",
+      "美国": "🇺🇸", "英语": "🇺🇸", "english": "🇺🇸", "en": "🇺🇸", "en-us": "🇺🇸", "usa": "🇺🇸", "united states": "🇺🇸",
+      "日本": "🇯🇵", "日语": "🇯🇵", "日本語": "🇯🇵", "ja": "🇯🇵", "japan": "🇯🇵",
+      "韩国": "🇰🇷", "韩语": "🇰🇷", "한국어": "🇰🇷", "ko": "🇰🇷", "korea": "🇰🇷",
+      "泰国": "🇹🇭", "泰语": "🇹🇭", "ภาษาไทย": "🇹🇭", "th": "🇹🇭", "thailand": "🇹🇭",
+      "越南": "🇻🇳", "越南语": "🇻🇳", "tiếng việt": "🇻🇳", "vi": "🇻🇳", "vietnam": "🇻🇳",
+      "印度": "🇮🇳", "印地语": "🇮🇳", "हिन्दी": "🇮🇳", "hi": "🇮🇳", "india": "🇮🇳",
+      "俄罗斯": "🇷🇺", "俄语": "🇷🇺", "русский": "🇷🇺", "ru": "🇷🇺", "russia": "🇷🇺",
+      "法国": "🇫🇷", "法语": "🇫🇷", "français": "🇫🇷", "fr": "🇫🇷", "france": "🇫🇷",
+      "德国": "🇩🇪", "德语": "🇩🇪", "deutsch": "🇩🇪", "de": "🇩🇪", "germany": "🇩🇪",
+      "西班牙": "🇪🇸", "西班牙语": "🇪🇸", "español": "🇪🇸", "es": "🇪🇸", "spain": "🇪🇸"
+    };
+    if (map[v]) return map[v];
+    if (map[lower]) return map[lower];
+    // 已经是 emoji 国旗时直接返回前两个区域指示符。
+    if (/^[\uD83C][\uDDE6-\uDDFF]/.test(v)) return v.slice(0, 4);
+    return "";
+  }
+  function avatarProfileHash(uid) {
+    var u = getMergedUserByUid(uid);
+    return [
+      u.picture || "",
+      u.userslug || "",
+      u.language_flag || u.languageFlag || u.countryFlag || u.country_flag || u.flag || u.nationality || u.country || "",
+      u.status || "",
+      userIsOnline(u) ? 1 : 0,
+      u.profileVersion || 0,
+      u.cacheAt || 0
+    ].join(",");
   }
   function getAvatarHtml(uid, username) {
     uid = String(uid || "");
-    var u = getAjaxUserByUid(uid) || state.userCache[uid] || null;
+    var u = getMergedUserByUid(uid);
     if (u) username = displayNameFromUser(u, username || (uid ? "用户" + uid : "用户"));
-    var pic = (u && u.picture) || "";
-    var text = (u && (u.icontext || u["icon:text"])) || String(username || uid || "?").charAt(0).toUpperCase();
-    var bg = (u && (u.iconbgColor || u["icon:bgColor"])) || "#72a5f2";
+    var pic = u.picture || "";
+    var text = (u.icontext || u["icon:text"]) || String(username || uid || "?").charAt(0).toUpperCase();
+    var bg = (u.iconbgColor || u["icon:bgColor"]) || "#72a5f2";
     var core = pic ? '<img class="avatar" src="' + escAttr(pic) + '" />' : '<div class="avatar cp-avatar-fallback" style="background:' + escAttr(bg) + '">' + esc(text) + '</div>';
-    var online = userIsOnline(u) ? '<span class="cp-avatar-online" aria-label="在线"></span>' : "";
-    return '<span class="cp-avatar-stack">' + core + online + '</span>';
+    var flag = flagEmojiFromLanguageFlag(u.language_flag || u.languageFlag || u.countryFlag || u.country_flag || u.flag || u.nationality || u.country || "");
+    var flagHtml = flag ? '<span class="cp-avatar-flag" aria-hidden="true">' + esc(flag) + '</span>' : '';
+    var onlineHtml = userIsOnline(u) ? '<span class="cp-avatar-online" aria-label="在线"></span>' : '';
+    return '<span class="cp-avatar-stack">' + core + flagHtml + onlineHtml + '</span>';
   }
   function getUserProfileHref(uid, username) {
     uid = String(uid || "");
-    var u = getAjaxUserByUid(uid) || state.userCache[uid] || null;
+    var u = getMergedUserByUid(uid);
     var slug = (u && (u.userslug || u.slug || u.username)) || username || (u && u.displayname) || "";
     if (!slug && String(uid) === String(state.uid) && window.app && app.user) slug = app.user.userslug || app.user.username || "";
     return slug ? ("/user/" + encodeURIComponent(String(slug)) + "/topics") : "#";
@@ -336,6 +451,7 @@
       var raw = localStorage.getItem(KEY_USER_CACHE);
       if (!raw) return;
       var data = JSON.parse(raw);
+      if (!data || Number(data.version || 0) < 31) return;
       var users = data && data.users ? data.users : {};
       var n = Date.now();
       Object.keys(users).forEach(function (uid) {
@@ -347,40 +463,39 @@
   function saveUserCacheLocalSoon() {
     clearTimeout(state.userCacheTimer);
     state.userCacheTimer = setTimeout(function () {
-      try { localStorage.setItem(KEY_USER_CACHE, JSON.stringify({ version: 30, ts: Date.now(), users: state.userCache || {} })); } catch (_) {}
+      try { localStorage.setItem(KEY_USER_CACHE, JSON.stringify({ version: 31, ts: Date.now(), users: state.userCache || {} })); } catch (_) {}
     }, 600);
   }
   function applyResolvedUser(uid, user) {
     uid = String(uid || (user && user.uid) || "");
-    if (!uid || !user) return;
-    state.userCache[uid] = {
-      loaded: true,
-      uid: uid,
-      username: user.username || displayNameFromUser(user, "用户" + uid),
-      displayname: displayNameFromUser(user, "用户" + uid),
-      picture: user.picture || user.uploadedpicture || "",
-      icontext: user.icontext || user["icon:text"] || "",
-      iconbgColor: user.iconbgColor || user["icon:bgColor"] || "#72a5f2",
-      userslug: user.userslug || user.slug || user.username || "",
-      online: userIsOnline(user),
-      cacheAt: Date.now(),
-      cacheExpiresAt: Date.now() + 30 * 24 * 3600 * 1000
-    };
+    if (!uid || !user) return false;
+    var prev = state.userCache[uid] || {};
+    var normalized = normalizeUserProfile(user, uid);
+    var merged = mergeUserObjects(prev, normalized);
+    merged.loaded = true;
+    merged.uid = uid;
+    merged.cacheAt = Date.now();
+    merged.cacheExpiresAt = Date.now() + USER_CACHE_TTL_MS;
+    merged.profileVersion = Date.now();
+    var before = avatarProfileHash(uid);
+    state.userCache[uid] = merged;
+    return before !== avatarProfileHash(uid);
   }
-  function queueResolveUsers(uids) {
+  function queueResolveUsers(uids, force) {
     uids = Array.isArray(uids) ? uids : [uids];
     var added = false;
     uids.forEach(function (uid) {
       uid = String(uid || "").trim();
       if (!uid) return;
       var local = getAjaxUserByUid(uid);
-      if (local) { applyResolvedUser(uid, local); added = true; return; }
+      if (local) applyResolvedUser(uid, local);
       var cached = state.userCache[uid];
-      if (cached && cached.loaded && (!cached.cacheExpiresAt || Number(cached.cacheExpiresAt) > Date.now())) return;
+      var hasFreshBadges = cached && cached.loaded && userHasProfileBadges(cached) && cached.cacheAt && (Date.now() - Number(cached.cacheAt)) < USER_CACHE_STALE_REFRESH_MS;
+      if (!force && hasFreshBadges) return;
       state.userBatchPending[uid] = true;
       added = true;
     });
-    if (!added) return;
+    if (!added) { saveUserCacheLocalSoon(); return; }
     clearTimeout(state.userBatchTimer);
     state.userBatchTimer = setTimeout(fetchPendingUsersBatch, 180);
   }
@@ -395,20 +510,40 @@
     queueResolveUsers(out);
   }
   async function fetchPendingUsersBatch() {
-    var pending = Object.keys(state.userBatchPending || {}).slice(0, 50);
+    var pending = Object.keys(state.userBatchPending || {}).slice(0, 80);
     pending.forEach(function (uid) { delete state.userBatchPending[uid]; });
     if (!pending.length) return;
-    var url = String(((window.config && window.config.cpWukongTopicChat) || {}).userBatchUrl || CONFIG.usersBatchUrl || "/nodebb-users");
+    var baseUrl = String(((window.config && window.config.cpWukongTopicChat) || {}).userBatchUrl || CONFIG.usersBatchUrl || "/nodebb-users");
+    var urls = [];
+    function addUrl(u) { if (u && urls.indexOf(u) < 0) urls.push(u); }
+    addUrl(baseUrl);
+    if (baseUrl.indexOf("/bridge/") !== 0) addUrl("/bridge" + baseUrl);
+    addUrl("/nodebb-users");
+    addUrl("/bridge/nodebb-users");
     try {
-      var res = await fetch(url + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
-      if (!res.ok && url.indexOf("/nodebb-users") === 0) res = await fetch("/bridge" + url + "?uids=" + encodeURIComponent(pending.join(",")), { credentials: "include", cache: "no-store" });
-      if (!res.ok) throw new Error("user batch " + res.status);
-      var data = await res.json();
-      (Array.isArray(data && data.users) ? data.users : []).forEach(function (u) { applyResolvedUser(u && u.uid, u); });
+      var data = null;
+      var lastErr = null;
+      for (var i = 0; i < urls.length; i++) {
+        try {
+          var res = await fetch(urls[i] + "?uids=" + encodeURIComponent(pending.join(",")) + "&_=" + Date.now(), { credentials: "include", cache: "no-store" });
+          if (!res.ok) { lastErr = new Error("user batch " + res.status + " @ " + urls[i]); continue; }
+          data = await res.json();
+          break;
+        } catch (e) { lastErr = e; }
+      }
+      if (!data) throw lastErr || new Error("user batch empty");
+      var changed = false;
+      (Array.isArray(data && data.users) ? data.users : []).forEach(function (u) { if (applyResolvedUser(u && u.uid, u)) changed = true; });
       saveUserCacheLocalSoon();
-      queueRender("keep");
+      if (changed) queueRender("keep");
     } catch (e) {
       warn("resolve-users", e);
+      // 失败时保留本地资料，不反复刷接口；30 秒后才允许再次尝试。
+      pending.forEach(function (uid) {
+        if (!state.userCache[uid]) state.userCache[uid] = { loaded: false, uid: uid };
+        state.userCache[uid].cacheAt = Date.now() - USER_CACHE_STALE_REFRESH_MS + 30000;
+      });
+      saveUserCacheLocalSoon();
     }
   }
 
@@ -1255,7 +1390,8 @@
       m.text || "", m.serverText || "", m.type || "", m.mediaUrl || "", m.audioUrl || "",
       m.durationStr || "", m.quote || "", m.quoteMsgId || "", m.mentionMe ? 1 : 0,
       prev ? prev.id : "", next ? next.id : "", lastPeerTextMsgId === m.id ? 1 : 0,
-      displayNameForMessage(m)
+      displayNameForMessage(m), avatarProfileHash(m.uid),
+      m.quoteUid ? avatarProfileHash(m.quoteUid) : ""
     ].join("|");
   }
   function buildMessageInner(m, prev, next, lastPeerTextMsgId) {
@@ -1282,7 +1418,8 @@
     var qText = String(m.quote || "").trim();
     var hasQuote = !!(qText || m.quoteMediaUrl || m.quoteAudioUrl);
     if (hasQuote && !qText) qText = "[引用消息]";
-    var qName = m.quoteUser || (m.quoteUid && state.userCache[m.quoteUid] ? (state.userCache[m.quoteUid].displayname || state.userCache[m.quoteUid].username) : "引用");
+    var qUser = m.quoteUid ? getMergedUserByUid(m.quoteUid) : null;
+    var qName = m.quoteUser || (qUser ? (qUser.displayname || qUser.username) : "引用");
     var quoteHtml = hasQuote ? replyHint + '<div class="cp-quote-card' + (m.quoteUid && String(m.quoteUid) === String(state.uid) ? ' is-mine-ref' : '') + '" data-quote-mid="' + escAttr(m.quoteMsgId || '') + '"><div><b>' + esc(qName) + '</b><span>' + esc(qText) + '</span></div></div>' : replyHint;
     var body = "", bubbleExtra = "", time = formatTime(m.ts);
     if (m.type === "image") {
@@ -1567,6 +1704,152 @@
     } finally { state.sendLock = false; }
   }
 
+  function readFile(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function (e) { resolve(e.target.result); };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+  function loadImage(src) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+  function ensureImageCompressionLib() {
+    if (window.imageCompression) return Promise.resolve(window.imageCompression);
+    if (window.__cpImageCompressionLoading) return window.__cpImageCompressionLoading;
+    window.__cpImageCompressionLoading = new Promise(function (resolve) {
+      var s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/browser-image-compression@2.0.2/dist/browser-image-compression.js";
+      s.async = true;
+      s.onload = function () { resolve(window.imageCompression || null); };
+      s.onerror = function () { resolve(null); };
+      document.head.appendChild(s);
+    });
+    return window.__cpImageCompressionLoading;
+  }
+  async function canEncode(type) {
+    if (state.encodeSupport[type] !== undefined) return state.encodeSupport[type];
+    var canvas = document.createElement("canvas");
+    canvas.width = 1; canvas.height = 1;
+    if (!canvas.toBlob) { state.encodeSupport[type] = false; return false; }
+    var ok = await new Promise(function (resolve) { canvas.toBlob(function (blob) { resolve(!!blob && blob.type === type); }, type, 0.8); });
+    state.encodeSupport[type] = ok;
+    return ok;
+  }
+  function extForMime(type) {
+    if (type === "image/webp") return ".webp";
+    if (type === "image/png") return ".png";
+    if (type === "audio/ogg") return ".ogg";
+    if (type === "audio/mp4") return ".m4a";
+    return ".jpg";
+  }
+  async function compressWithCanvas(file, targetType) {
+    var dataUrl = await readFile(file);
+    var img = await loadImage(dataUrl);
+    var w = img.naturalWidth || img.width;
+    var h = img.naturalHeight || img.height;
+    var scale = Math.min(1, IMAGE_CONFIG.maxSide / Math.max(w, h));
+    w = Math.max(1, Math.round(w * scale));
+    h = Math.max(1, Math.round(h * scale));
+    var canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    var ctx = canvas.getContext("2d");
+    if (!ctx || !canvas.toBlob) return null;
+    ctx.drawImage(img, 0, 0, w, h);
+    var targetBytes = IMAGE_CONFIG.maxSizeMB * 1024 * 1024;
+    var qualities = [IMAGE_CONFIG.quality, 0.52, 0.45, 0.38];
+    var best = null;
+    for (var i = 0; i < qualities.length; i++) {
+      var blob = await new Promise(function (resolve) { canvas.toBlob(resolve, targetType, qualities[i]); });
+      if (!blob) continue;
+      best = blob;
+      if (blob.size <= targetBytes) break;
+    }
+    return best;
+  }
+  async function compressImage(file) {
+    if (!file || !/^image\//i.test(file.type)) return file;
+    if (/image\/(gif|svg\+xml)/i.test(file.type)) return file;
+    if (file.size < IMAGE_CONFIG.minCompressBytes) return file;
+    var targetType = IMAGE_CONFIG.useWebp && (await canEncode("image/webp")) ? "image/webp" : "image/jpeg";
+    var baseName = String(file.name || ("image-" + Date.now())).replace(/\.[^.]+$/, "");
+    try {
+      var imageCompression = await ensureImageCompressionLib();
+      if (imageCompression) {
+        var blob = await imageCompression(file, {
+          maxSizeMB: IMAGE_CONFIG.maxSizeMB,
+          maxWidthOrHeight: IMAGE_CONFIG.maxSide,
+          useWebWorker: true,
+          fileType: targetType,
+          initialQuality: IMAGE_CONFIG.quality,
+          alwaysKeepResolution: false,
+          preserveExif: false
+        });
+        if (blob && blob.size > 0 && blob.size < file.size * 0.98) {
+          return new File([blob], baseName + extForMime(targetType), { type: targetType, lastModified: Date.now() });
+        }
+      }
+    } catch (err) { warn("lib-image-compress", err); }
+    try {
+      var blob2 = await compressWithCanvas(file, targetType);
+      if (!blob2 || blob2.size >= file.size * 0.98) return file;
+      return new File([blob2], baseName + extForMime(targetType), { type: targetType, lastModified: Date.now() });
+    } catch (err2) { warn("compress-image", err2); return file; }
+  }
+  async function compressVideo(file, maxSizeThreshold, maxDuration) {
+    maxSizeThreshold = maxSizeThreshold || VIDEO_CONFIG.maxSizeThreshold;
+    maxDuration = maxDuration || VIDEO_CONFIG.maxDuration;
+    if (!file || !/^video\//i.test(file.type)) return file;
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return file;
+    var inputUrl = URL.createObjectURL(file);
+    try {
+      var video = document.createElement("video");
+      video.src = inputUrl; video.muted = true; video.playsInline = true;
+      await new Promise(function (resolve, reject) { video.onloadedmetadata = resolve; video.onerror = reject; });
+      if (video.duration > maxDuration) { var tooLong = new Error("视频过长，最多 " + maxDuration + " 秒"); tooLong.code = "VIDEO_TOO_LONG"; throw tooLong; }
+      if (file.size <= maxSizeThreshold) return file;
+      if (video.videoWidth === 0 || video.videoHeight === 0) throw new Error("视频无效");
+      var scale = Math.min(1, VIDEO_CONFIG.maxWidth / Math.max(1, video.videoWidth));
+      var width = Math.max(2, Math.round(video.videoWidth * scale));
+      var height = Math.max(2, Math.round(video.videoHeight * scale));
+      var canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      var ctx = canvas.getContext("2d");
+      if (!ctx) return file;
+      var canvasStream = canvas.captureStream(VIDEO_CONFIG.fps);
+      var audioTracks = [];
+      try { if (video.captureStream) audioTracks = Array.prototype.slice.call(video.captureStream().getAudioTracks()); } catch (_) {}
+      var outputStream = new MediaStream(Array.prototype.slice.call(canvasStream.getVideoTracks()).concat(audioTracks));
+      var mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus") ? "video/webm;codecs=vp8,opus" : "video/webm";
+      var chunks = [];
+      var recorder = new MediaRecorder(outputStream, { mimeType: mimeType, videoBitsPerSecond: VIDEO_CONFIG.videoBitsPerSecond, audioBitsPerSecond: VIDEO_CONFIG.audioBitsPerSecond });
+      recorder.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+      var drawing = true;
+      var draw = function () { if (!drawing) return; try { ctx.drawImage(video, 0, 0, width, height); } catch (_) {} if (!video.paused && !video.ended) requestAnimationFrame(draw); };
+      var finished = new Promise(function (resolve) { recorder.onstop = resolve; });
+      recorder.start(500);
+      await video.play();
+      draw();
+      await new Promise(function (resolve) { video.onended = resolve; video.onerror = resolve; });
+      drawing = false;
+      recorder.stop();
+      await finished;
+      var blob = new Blob(chunks, { type: mimeType });
+      if (!blob.size || blob.size >= file.size) return file;
+      return new File([blob], String(file.name || "video-" + Date.now()).replace(/\.[^.]+$/, ".webm"), { type: blob.type || "video/webm", lastModified: Date.now() });
+    } catch (err) {
+      warn("compress-video", err);
+      if (err && err.code === "VIDEO_TOO_LONG") throw err;
+      return file;
+    } finally { URL.revokeObjectURL(inputUrl); }
+  }
+
   function parseUploadUrl(rawText) {
     var raw = typeof rawText === "string" ? rawText : JSON.stringify(rawText || "");
     var json = null;
@@ -1630,14 +1913,23 @@
     try {
       for (var i = 0; i < files.length; i++) {
         if (pWrap) pWrap.hidden = false; if (pBar) pBar.style.width = "0%";
-        var f = files[i];
-        if (/^video\//i.test(f.type || "") && f.size > 30 * 1024 * 1024) { toast("视频不能超过 30MB"); continue; }
+        var original = files[i];
+        var f = original;
+        if (/^image\//i.test(original.type || "")) {
+          toast("正在压缩图片...");
+          f = await compressImage(original);
+        } else if (/^video\//i.test(original.type || "")) {
+          toast("正在处理视频...");
+          f = await compressVideo(original, VIDEO_CONFIG.maxSizeThreshold, VIDEO_CONFIG.maxDuration);
+          if (f.size > VIDEO_CONFIG.maxSizeThreshold * 1.5) { toast("视频过大，建议压缩后再发"); }
+        }
+        toast(f !== original ? "压缩完成，正在上传..." : "正在上传...");
         var url = await uploadToNodeBB(f, function (pct) { if (pBar) pBar.style.width = pct * 100 + "%"; });
-        if (/^image\//i.test(f.type || "")) await sendTopicText("![](" + url + ")", { allowTranslate: false });
-        else if (/^video\//i.test(f.type || "")) await sendTopicText("[视频](" + url + ")", { allowTranslate: false });
+        if (/^image\//i.test(f.type || original.type || "")) await sendTopicText("![](" + url + ")", { allowTranslate: false });
+        else if (/^video\//i.test(f.type || original.type || "")) await sendTopicText("[视频](" + url + ")", { allowTranslate: false });
         else await sendTopicText("[文件](" + url + ")", { allowTranslate: false });
       }
-    } catch (err) { warn("pick-media", err); toast("上传失败：" + String(err.message || err).slice(0, 60)); }
+    } catch (err) { warn("pick-media", err); toast(String(err && err.code === "VIDEO_TOO_LONG" ? err.message : ("上传失败：" + String(err.message || err).slice(0, 60)))); }
     finally { if (pWrap) pWrap.hidden = true; if (pBar) pBar.style.width = "0%"; e.target.value = ""; }
   }
 
@@ -1853,6 +2145,31 @@
       fetch(CONFIG.activityTouchUrl, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tid: state.topic.tid, cid: state.topic.cid, title: state.topic.title, channel_id: state.channelId, text: msg && (msg.serverText || msg.text || "") }) }).catch(function(){});
     } catch (_) {}
   }
+  async function compressBackgroundToDataUrl(file) {
+    if (!file || !/^image\//i.test(file.type)) throw new Error("请选择图片文件");
+    var dataUrl = await readFile(file);
+    var img = await loadImage(dataUrl);
+    var w = img.naturalWidth || img.width;
+    var h = img.naturalHeight || img.height;
+    var maxSide = 1600;
+    var scale = Math.min(1, maxSide / Math.max(w, h));
+    w = Math.max(1, Math.round(w * scale));
+    h = Math.max(1, Math.round(h * scale));
+    var canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    var ctx = canvas.getContext("2d");
+    if (!ctx) return dataUrl;
+    ctx.drawImage(img, 0, 0, w, h);
+    var type = (await canEncode("image/webp")) ? "image/webp" : "image/jpeg";
+    var qualityList = [0.82, 0.72, 0.62, 0.52];
+    var best = "";
+    for (var i = 0; i < qualityList.length; i++) {
+      best = canvas.toDataURL(type, qualityList[i]);
+      if (best.length < 1800 * 1024) break;
+    }
+    return best || dataUrl;
+  }
+
   function applyBackground() {
     var bg = byId("cp-topic-bg"), root = byId(ROOT_ID);
     if (!state.bg) state.bg = cloneJSON(DEFAULT_BG);
@@ -1860,14 +2177,23 @@
     if (root) { root.style.setProperty("--cp-bg-dim", String(Math.min(Number(state.bg.opacity || DEFAULT_BG.opacity), 0.45))); root.style.setProperty("--cp-bg-blur", String(Number(state.bg.blur || 0)) + "px"); }
     document.body.classList.toggle("cp-topic-has-bg", !!state.bg.dataUrl);
   }
-  function handleBackgroundUpload(e) {
+  async function handleBackgroundUpload(e) {
     var file = e && e.target && e.target.files && e.target.files[0];
     if (!file) return;
-    var reader = new FileReader();
-    reader.onload = function (ev) { state.bg.dataUrl = ev.target.result; saveJSON(KEY_BG, state.bg); applyBackground(); syncTranslateUI(); toast("背景已保存到本机"); };
-    reader.onerror = function () { toast("背景读取失败"); };
-    reader.readAsDataURL(file);
-    e.target.value = "";
+    try {
+      toast("正在处理背景图...");
+      var dataUrl = await compressBackgroundToDataUrl(file);
+      state.bg = { dataUrl: dataUrl, opacity: state.bg && state.bg.opacity != null ? Math.min(Number(state.bg.opacity), 0.45) : DEFAULT_BG.opacity, blur: state.bg && state.bg.blur != null ? Number(state.bg.blur) : DEFAULT_BG.blur };
+      saveJSON(KEY_BG, state.bg);
+      applyBackground();
+      syncTranslateUI();
+      toast("背景已保存到本机");
+    } catch (err) {
+      warn("background-upload", err);
+      toast("背景设置失败：" + String(err.message || err).slice(0, 60));
+    } finally {
+      if (e && e.target) e.target.value = "";
+    }
   }
 
   async function mount() {
@@ -1914,9 +2240,56 @@
 
   window.cpTopicChatDebug = {
     state: state,
-    version: "v26-perf",
+    version: "v27-perf-stable",
     renderNow: function () { queueRender("keep"); },
     forceBottom: forceBottom,
     parseUploadUrl: parseUploadUrl
   };
+})();
+
+
+/* Optional category 7 visual sort by WuKong topic chat activity. No polling; runs after page load/ajaxify only. */
+(function () {
+  "use strict";
+  if (window.__cpCategory7ActivitySortV27Stable) return;
+  window.__cpCategory7ActivitySortV27Stable = true;
+  var CID = 7;
+  function isCat7() {
+    return document.body && document.body.classList.contains("page-category") && /\/category\/7(?:\/|$)/.test(location.pathname);
+  }
+  function tidFromHref(href) {
+    var m = String(href || "").match(/\/topic\/(\d+)/);
+    return m ? m[1] : "";
+  }
+  function findTopicRows() {
+    var anchors = Array.prototype.slice.call(document.querySelectorAll('a[href*="/topic/"]'));
+    var rows = [], seen = {};
+    anchors.forEach(function (a) {
+      var tid = tidFromHref(a.getAttribute("href"));
+      if (!tid || seen[tid]) return;
+      var row = a.closest('[component="category/topic"], [component="topic"], li, .card, .category-item, .topic-row');
+      if (!row || !row.parentNode) return;
+      seen[tid] = true;
+      rows.push({ tid: tid, row: row, parent: row.parentNode });
+    });
+    return rows;
+  }
+  async function sortByActivity() {
+    if (!isCat7()) return;
+    var rows = findTopicRows();
+    if (!rows.length) return;
+    var res = await fetch('/bridge/topic-activity?cid=' + CID + '&_=' + Date.now(), { credentials: 'include', cache: 'no-store' }).catch(function () { return null; });
+    if (!res || !res.ok) return;
+    var json = await res.json().catch(function () { return null; });
+    var list = (json && json.list) || [];
+    var map = {};
+    list.forEach(function (x) { map[String(x.tid)] = Number(x.last_chat_at || 0); });
+    rows.sort(function (a, b) { return (map[b.tid] || 0) - (map[a.tid] || 0); });
+    rows.forEach(function (x) { if (x.parent && x.row) x.parent.appendChild(x.row); });
+  }
+  function boot() { setTimeout(sortByActivity, 450); setTimeout(sortByActivity, 1200); }
+  if (window.jQuery) $(window).on("action:ajaxify.end", boot);
+  document.addEventListener("DOMContentLoaded", boot);
+  window.addEventListener("load", boot);
+  boot();
 })();
