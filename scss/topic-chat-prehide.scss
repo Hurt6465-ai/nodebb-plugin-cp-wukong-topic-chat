@@ -1,51 +1,36 @@
-body.cp-wk-prehide-enabled .topic .posts,
-body.cp-wk-prehide-enabled .topic .topic-main-buttons,
-body.cp-wk-prehide-enabled [component='post'] {
-  opacity: 0;
-  pointer-events: none;
+/* CP Wukong Topic Chat prehide - v32 */
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) [component="topic"],
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) [component="post"],
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) [component="topic/quickreply/container"],
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) .topic,
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) .posts,
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) .pagination-block,
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) [component="pagination"],
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted) .topic-main-buttons {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  animation: cp-topic-prehide-fallback 0s linear 1.8s forwards;
 }
-
-body.cp-wk-prehide-enabled.cp-wk-topic-chat-ready .topic .posts,
-body.cp-wk-prehide-enabled.cp-wk-topic-chat-ready .topic .topic-main-buttons,
-body.cp-wk-prehide-enabled.cp-wk-topic-chat-ready [component='post'] {
-  opacity: 1;
-  pointer-events: auto;
+body.page-topic.page-topic-category-7:not(.cp-topic-chat-mounted)::before {
+  content: "正在打开聊天室…";
+  position: fixed;
+  left: 50%;
+  top: 45%;
+  transform: translate(-50%, -50%);
+  z-index: 20;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.88);
+  color: #667085;
+  font-size: 14px;
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.12);
+  animation: cp-topic-prehide-loader-hide 0s linear 1.8s forwards;
 }
-
-body.cp-wk-prehide-enabled .cp-wukong-topic-chat-preloader {
-  display: flex;
-}
-
-.cp-wukong-topic-chat-preloader {
-  display: none;
-  align-items: center;
-  justify-content: center;
-  min-height: 180px;
-  padding: 1rem;
-  color: var(--bs-secondary-color, #6c757d);
-}
-
-/* CP Wukong topic chat prehide.
- * This CSS is compiled by NodeBB before the frontend JS runs, so category 7 topic
- * pages no longer flash the original post UI before the chat shell mounts.
- * Safety: if the chat JS does not mount, the original topic UI is shown again after 1.6s.
- */
-
-body.page-topic.page-topic-category-7:not(.cp-topic-chat-on-v20) .topic {
-  opacity: 0;
-  pointer-events: none;
-  animation: cp-topic-chat-prehide-fallback 0s linear 1.6s forwards;
-}
-
-body.page-topic.page-topic-category-7.cp-topic-chat-on-v20 .topic {
-  opacity: 1;
-  pointer-events: auto;
-  animation: none;
-}
-
-@keyframes cp-topic-chat-prehide-fallback {
-  to {
-    opacity: 1;
-    pointer-events: auto;
-  }
-}
+body.cp-topic-chat-mounted::before,
+body.cp-topic-chat-on-v20::before { content: none !important; display: none !important; }
+@keyframes cp-topic-prehide-fallback { to { opacity: 1; pointer-events: auto; } }
+@keyframes cp-topic-prehide-loader-hide { to { opacity: 0; visibility: hidden; pointer-events: none; } }
+.cp-unread-sep { display:flex; justify-content:center; align-items:center; margin:14px 0; color:#8a94a6; font-size:13px; }
+.cp-unread-sep span { padding:4px 12px; border-radius:999px; background:rgba(255,255,255,0.78); box-shadow:0 1px 5px rgba(15,23,42,.06); }
+.cp-msg-highlight { animation: cp-msg-highlight-pulse 1.8s ease-out; }
+@keyframes cp-msg-highlight-pulse { 0%,100%{box-shadow:none;} 18%{box-shadow:0 0 0 4px rgba(59,130,246,.22),0 0 0 10px rgba(59,130,246,.10);} }
