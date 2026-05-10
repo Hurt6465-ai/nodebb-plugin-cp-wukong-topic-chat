@@ -1,5 +1,5 @@
 /*
- * CP NodeBB Topic WuKong Chat - CID 7 - v36-notice-reply-fix
+ * CP NodeBB Topic WuKong Chat - CID 7 - v37-reply-meta-category-clean
  * 重点改动：
  * - 保留板块 7 视觉排序 IIFE，但不轮询 /bridge/topic-activity。
  * - 消息列表改为增量渲染，不再 list.innerHTML 重建整个屏幕。
@@ -216,12 +216,12 @@
   };
 
   function warn(scope, err) {
-    try { console.warn("[cp-topic-wukong-v36-notice-reply-fix][" + scope + "]", err); } catch (_) {}
+    try { console.warn("[cp-topic-wukong-v37-reply-meta-category-clean][" + scope + "]", err); } catch (_) {}
   }
 
   function log(scope, data) {
     if (!CONFIG.debug) return;
-    try { console.log("[cp-topic-wukong-v36-notice-reply-fix][" + scope + "]", data || ""); } catch (_) {}
+    try { console.log("[cp-topic-wukong-v37-reply-meta-category-clean][" + scope + "]", data || ""); } catch (_) {}
   }
 
   function byId(id) { return document.getElementById(id); }
@@ -235,6 +235,72 @@
   function escAttr(str) { return esc(str).replace(/"/g, "&quot;"); }
   function normalizeText(str) { return String(str == null ? "" : str).replace(/\s+/g, " ").trim().slice(0, 800); }
   function cloneJSON(obj) { return JSON.parse(JSON.stringify(obj || {})); }
+  var CP_META_PREFIX = "\u2063CPWKG:";
+  var CP_META_SUFFIX = "\u2063";
+  function b64UrlEncodeUnicode(str) {
+    try {
+      return btoa(unescape(encodeURIComponent(String(str || ""))))
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    } catch (_) { return ""; }
+  }
+  function b64UrlDecodeUnicode(str) {
+    try {
+      str = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+      while (str.length % 4) str += "=";
+      return decodeURIComponent(escape(atob(str)));
+    } catch (_) { return ""; }
+  }
+  function hasReplyOrMentionMeta(meta) {
+    meta = meta || {};
+    return !!(
+      meta.quote || meta.quote_text || meta.quoteText || meta.quote_uid || meta.quoteUid ||
+      meta.reply_to_uid || meta.replyToUid || meta.quote_msg_id || meta.quoteMsgId ||
+      meta.reply_to_msg_id || meta.replyToMsgId || meta.reply ||
+      (Array.isArray(meta.mention_uids) && meta.mention_uids.length) ||
+      (Array.isArray(meta.mentionUids) && meta.mentionUids.length)
+    );
+  }
+  function packCpMetaText(text, meta) {
+    text = String(text == null ? "" : text);
+    if (!hasReplyOrMentionMeta(meta)) return text;
+    var encoded = b64UrlEncodeUnicode(JSON.stringify(meta || {}));
+    return encoded ? (text + CP_META_PREFIX + encoded + CP_META_SUFFIX) : text;
+  }
+  function unpackCpMetaText(text) {
+    text = String(text == null ? "" : text);
+    var found = null;
+    var clean = text.replace(/\u2063CPWKG:([A-Za-z0-9_-]+)\u2063/g, function (_, raw) {
+      try {
+        var json = b64UrlDecodeUnicode(raw);
+        var obj = json ? JSON.parse(json) : null;
+        if (obj && typeof obj === "object") found = mergeDeep(found || {}, obj);
+      } catch (_) {}
+      return "";
+    });
+    return { text: clean, meta: found || null };
+  }
+  function mergeEmbeddedMetaPayload(payload, textValue) {
+    var unpacked = unpackCpMetaText(textValue);
+    if (!unpacked.meta) return { payload: payload || {}, text: String(textValue == null ? "" : textValue) };
+    var merged = mergeDeep(mergeDeep({}, unpacked.meta), payload || {});
+    merged.text = unpacked.text;
+    merged.content = unpacked.text;
+    merged.message = unpacked.text;
+    return { payload: merged, text: unpacked.text };
+  }
+  function normalizeReplyObject(payload) {
+    payload = payload || {};
+    var r = payload.reply || payload.reply_info || payload.replyInfo || payload.quoteReply || null;
+    if (!r || typeof r !== "object") return payload;
+    if (!payload.quote && !payload.quote_text && !payload.quoteText) payload.quote = r.text || r.content || r.quote || r.preview || "";
+    if (!payload.quoteUser && !payload.replyUser) payload.quoteUser = r.user || r.username || r.displayname || r.name || "";
+    if (!payload.quote_uid && !payload.quoteUid && !payload.reply_to_uid && !payload.replyToUid) payload.quote_uid = r.uid || r.userId || r.user_id || "";
+    if (!payload.quote_msg_id && !payload.quoteMsgId && !payload.reply_to_msg_id && !payload.replyToMsgId) payload.quote_msg_id = r.id || r.messageId || r.message_id || r.clientMsgNo || r.client_msg_no || "";
+    if (!payload.quote_type && !payload.quoteType && !payload.reply_type && !payload.replyType) payload.quote_type = r.type || r.msgType || "text";
+    if (!payload.quote_media_url && !payload.quoteMediaUrl) payload.quote_media_url = r.mediaUrl || r.media_url || r.url || "";
+    if (!payload.quote_audio_url && !payload.quoteAudioUrl) payload.quote_audio_url = r.audioUrl || r.audio_url || "";
+    return payload;
+  }
   function mergeDeep(base, extra) {
     extra = extra || {};
     Object.keys(extra).forEach(function (k) {
@@ -795,7 +861,7 @@
     msg.quoteType = String(msg.quoteType || "").trim();
     msg.quoteMediaUrl = String(msg.quoteMediaUrl || "").trim();
     msg.quoteAudioUrl = String(msg.quoteAudioUrl || "").trim();
-    if (isFakeQuoteText(msg.quote)) msg.quote = "";
+    if (isFakeQuoteText(msg.quote) && !msg.quoteMsgId && !msg.quoteUid) msg.quote = "";
     if (!msg.quote && !msg.quoteMediaUrl && !msg.quoteAudioUrl && msg.quoteMsgId) {
       var ref = getMsgByIdLocal(msg.quoteMsgId);
       if (ref) {
@@ -820,10 +886,13 @@
     return "";
   }
   function msgFromWk(m, forceMine) {
-    var payload = decodePayload(m);
+    var payload = normalizeReplyObject(decodePayload(m));
+    var rawTextCandidate = payload.text || payload.content || payload.message || "";
+    var unpackedPayload = mergeEmbeddedMetaPayload(payload, rawTextCandidate);
+    payload = normalizeReplyObject(unpackedPayload.payload);
     var fromUid = String(m.from_uid || m.fromUID || m.fromUid || payload.from_uid || payload.fromUID || "");
     var mine = forceMine != null ? !!forceMine : (fromUid && String(fromUid) === String(state.uid));
-    var serverText = payload.text || payload.content || payload.message || "[暂不支持的消息]";
+    var serverText = unpackedPayload.text || payload.text || payload.content || payload.message || "[暂不支持的消息]";
     var parsedServer = detectMessageKind(serverText, payload);
     var displayText = mine && payload.originalText ? payload.originalText : parsedServer.text;
     var parsedDisplay = detectMessageKind(displayText, payload);
@@ -858,13 +927,13 @@
       failed: false,
       local: false,
       wkMsg: m || null,
-      quote: payload.quote_text || payload.quoteText || payload.quote || payload.replyText || payload.replyPreview || (payload.reply && (payload.reply.text || payload.reply.quote || payload.reply.preview)) || "",
-      quoteUser: payload.quoteUser || payload.replyUser || payload.quote_from_name || payload.quoteFromName || (payload.reply && (payload.reply.user || payload.reply.username || payload.reply.displayname)) || "",
-      quoteUid: payload.quote_uid || payload.quoteUid || payload.reply_to_uid || payload.replyToUid || payload.quote_from_uid || payload.quoteFromUid || (payload.reply && (payload.reply.uid || payload.reply.userId)) || "",
-      quoteMsgId: payload.quote_msg_id || payload.quoteMsgId || payload.reply_to_msg_id || payload.replyToMsgId || (payload.reply && (payload.reply.id || payload.reply.messageId || payload.reply.clientMsgNo)) || "",
-      quoteType: payload.quote_type || payload.quoteType || payload.reply_type || payload.replyType || (payload.reply && payload.reply.type) || "",
-      quoteMediaUrl: payload.quote_media_url || payload.quoteMediaUrl || "",
-      quoteAudioUrl: payload.quote_audio_url || payload.quoteAudioUrl || "",
+      quote: payload.quote_text || payload.quoteText || payload.quote || payload.replyText || payload.replyPreview || payload.reply_content || payload.replyContent || (payload.reply && (payload.reply.text || payload.reply.content || payload.reply.quote || payload.reply.preview)) || "",
+      quoteUser: payload.quoteUser || payload.replyUser || payload.quote_from_name || payload.quoteFromName || payload.reply_from_name || payload.replyFromName || (payload.reply && (payload.reply.user || payload.reply.username || payload.reply.displayname || payload.reply.name)) || "",
+      quoteUid: payload.quote_uid || payload.quoteUid || payload.reply_to_uid || payload.replyToUid || payload.quote_from_uid || payload.quoteFromUid || payload.reply_uid || payload.replyUid || (payload.reply && (payload.reply.uid || payload.reply.userId || payload.reply.user_id)) || "",
+      quoteMsgId: payload.quote_msg_id || payload.quoteMsgId || payload.reply_to_msg_id || payload.replyToMsgId || payload.reply_msg_id || payload.replyMsgId || (payload.reply && (payload.reply.id || payload.reply.messageId || payload.reply.message_id || payload.reply.clientMsgNo || payload.reply.client_msg_no)) || "",
+      quoteType: payload.quote_type || payload.quoteType || payload.reply_type || payload.replyType || (payload.reply && (payload.reply.type || payload.reply.msgType)) || "",
+      quoteMediaUrl: payload.quote_media_url || payload.quoteMediaUrl || payload.reply_media_url || payload.replyMediaUrl || (payload.reply && (payload.reply.mediaUrl || payload.reply.media_url || payload.reply.url)) || "",
+      quoteAudioUrl: payload.quote_audio_url || payload.quoteAudioUrl || payload.reply_audio_url || payload.replyAudioUrl || (payload.reply && (payload.reply.audioUrl || payload.reply.audio_url)) || "",
       mentionUids: normalizeMentionList(payload),
       mentionMe: false,
       _ver: 1
@@ -1345,7 +1414,15 @@
   function closeSettings() { var m = byId("cp-topic-settings-mask"); if (m) m.hidden = true; }
 
   function injectStyle() {
-    /* 原第二段 CSS 可以继续使用；这里不追加 CSS。 */
+    if (document.getElementById("cp-topic-v37-runtime-fix-style")) return;
+    var style = document.createElement("style");
+    style.id = "cp-topic-v37-runtime-fix-style";
+    style.textContent = [
+      ".cp-at-pill{background:transparent!important;border:0!important;box-shadow:none!important;border-radius:0!important;padding:0!important;color:#2563eb!important;font-weight:700!important;}",
+      ".cp-quote-card{cursor:pointer;}",
+      "body.cp-cat7-hide-replies [component='category/topic'] [component='topic/post-count'],body.cp-cat7-hide-replies [component='category/topic'] [component='topic/reply-count']{display:none!important;}"
+    ].join("\n");
+    document.head.appendChild(style);
   }
   function injectRoot() {
     if (byId(ROOT_ID)) return;
@@ -1700,7 +1777,7 @@
     var senderName = displayNameForMessage(m) || m.username || "有人";
     var replyHint = (!m.mine && noticeType === "reply") ? '<div class="cp-reply-me-hint"><strong>' + esc(senderName) + '</strong> 回复了你</div>' : ((!m.mine && noticeType === "mention") ? '<div class="cp-reply-me-hint"><strong>' + esc(senderName) + '</strong> @了你</div>' : '');
     var qText = String(m.quote || "").trim();
-    var hasQuote = !!(qText || m.quoteMediaUrl || m.quoteAudioUrl);
+    var hasQuote = !!(qText || m.quoteMediaUrl || m.quoteAudioUrl || m.quoteMsgId || m.quoteUid);
     if (hasQuote && !qText) qText = "[引用消息]";
     var qUser = m.quoteUid ? getMergedUserByUid(m.quoteUid) : null;
     var qName = m.quoteUser || (qUser ? (qUser.displayname || qUser.username) : "引用");
@@ -1971,7 +2048,7 @@
       durationStr: opts.duration ? formatDuration(opts.duration) : "", originalText: "", translation: "", translationOpen: false, translationError: false,
       ts: Date.now(), sending: true, failed: false, local: true,
       quote: state.quoteTarget ? getQuotePreviewText(state.quoteTarget) : "", quoteUser: state.quoteTarget ? displayNameForMessage(state.quoteTarget) : "",
-      quoteUid: state.quoteTarget && state.quoteTarget.uid ? String(state.quoteTarget.uid) : "", quoteMsgId: state.quoteTarget && state.quoteTarget.id ? String(state.quoteTarget.id) : "",
+      quoteUid: state.quoteTarget && state.quoteTarget.uid ? String(state.quoteTarget.uid) : "", quoteMsgId: state.quoteTarget ? String(state.quoteTarget.messageId || state.quoteTarget.clientMsgNo || state.quoteTarget.id || "") : "",
       quoteType: state.quoteTarget ? (state.quoteTarget.type || "text") : "", quoteMediaUrl: state.quoteTarget ? (state.quoteTarget.mediaUrl || "") : "", quoteAudioUrl: state.quoteTarget ? (state.quoteTarget.audioUrl || "") : "",
       mentionUids: extractMentionUids(originalText), _ver: 1
     };
@@ -1986,12 +2063,14 @@
       if (!state.wkReady || !window.wk || !window.wk.WKSDK) throw new Error("WK not ready");
       var channel = new window.wk.Channel(state.channelId, CONFIG.channelType);
       var mentionUids = (local.mentionUids || extractMentionUids(originalText) || []).map(String).filter(Boolean);
-      var content = new window.wk.MessageText(textToSend);
+      var content = null;
+      var wireTextToSend = textToSend;
       function decorateOutgoingPayload(obj) {
         obj = obj && typeof obj === "object" ? obj : {};
-        obj.text = obj.text || textToSend;
-        obj.content = obj.content || textToSend;
+        obj.text = textToSend;
+        obj.content = textToSend;
         obj.username = getMyName();
+        obj.cp_meta_version = 2;
         if (textToSend !== originalText) obj.originalText = originalText;
         if (parsed.kind !== "text") obj.cpType = parsed.kind;
         if (parsed.mediaUrl) obj.mediaUrl = parsed.mediaUrl;
@@ -2048,11 +2127,14 @@
         }
         return obj;
       }
-      content.text = textToSend;
-      content.content = textToSend;
-      content.cpExtra = decorateOutgoingPayload({});
-      content.extra = content.cpExtra;
-      content.payload = content.cpExtra;
+      var cpExtraPayload = decorateOutgoingPayload({});
+      wireTextToSend = packCpMetaText(textToSend, cpExtraPayload);
+      content = new window.wk.MessageText(wireTextToSend);
+      content.text = wireTextToSend;
+      content.content = wireTextToSend;
+      content.cpExtra = cpExtraPayload;
+      content.extra = cpExtraPayload;
+      content.payload = cpExtraPayload;
       var rawEncode = content.encode && content.encode.bind(content);
       content.encode = function () {
         var p = rawEncode ? rawEncode() : { type: 1, content: textToSend, text: textToSend };
@@ -2564,12 +2646,12 @@
     return visible >= Math.min(48, Math.max(24, a.height * 0.45));
   }
   function scheduleMarkVisibleNoticesDone() {
-    if (!state.mounted || !(state.mentionNotices || []).length) return;
+    if (!state.mounted || !((state.mentionNotices || []).length || (state.replyNotices || []).length || (state.atNotices || []).length)) return;
     clearTimeout(state.visibleNoticeTimer);
     state.visibleNoticeTimer = setTimeout(markVisibleNoticesDone, 450);
   }
   function markVisibleNoticesDone() {
-    if (!state.mounted || !(state.mentionNotices || []).length) return;
+    if (!state.mounted || !((state.mentionNotices || []).length || (state.replyNotices || []).length || (state.atNotices || []).length)) return;
     var main = byId("cp-topic-main");
     if (!main) return;
     var rows = document.querySelectorAll("#cp-topic-msg-list .cp-row[data-mid]");
@@ -2753,7 +2835,7 @@
 
   window.cpTopicChatDebug = {
     state: state,
-    version: "v36-notice-reply-fix",
+    version: "v37-reply-meta-category-clean",
     renderNow: function () { queueRender("keep"); },
     forceBottom: forceBottom,
     parseUploadUrl: parseUploadUrl
@@ -2767,6 +2849,35 @@
   if (window.__cpCategory7ActivitySortV28Stable) return;
   window.__cpCategory7ActivitySortV28Stable = true;
   var CID = 7;
+  function installTopicListReplyCountHider() {
+    if (document.getElementById("cp-topic-list-hide-replies-style")) return;
+    var style = document.createElement("style");
+    style.id = "cp-topic-list-hide-replies-style";
+    style.textContent = '' +
+      'body.cp-cat7-hide-replies [component="category/topic"] [component="topic/post-count"], ' +
+      'body.cp-cat7-hide-replies [component="category/topic"] [component="topic/reply-count"], ' +
+      'body.cp-cat7-hide-replies [component="category/topic"] .post-count, ' +
+      'body.cp-cat7-hide-replies [component="category/topic"] .reply-count, ' +
+      'body.cp-cat7-hide-replies [component="category/topic"] .replies, ' +
+      'body.cp-cat7-hide-replies [component="category/topic"] .topic-replies, ' +
+      'body.cp-cat7-hide-replies .category [component="topic/post-count"], ' +
+      'body.cp-cat7-hide-replies .category [component="topic/reply-count"] { display: none !important; }';
+    document.head.appendChild(style);
+  }
+  function hideTopicReplyCounts() {
+    if (!isCat7()) { document.body.classList.remove("cp-cat7-hide-replies"); return; }
+    document.body.classList.add("cp-cat7-hide-replies");
+    installTopicListReplyCountHider();
+    var rows = document.querySelectorAll('[component="category/topic"], [component="topic"], .topic-row, .category-item');
+    Array.prototype.forEach.call(rows, function (row) {
+      var nodes = row.querySelectorAll('[component="topic/post-count"], [component="topic/reply-count"], .post-count, .reply-count, .replies, .topic-replies');
+      Array.prototype.forEach.call(nodes, function (el) { el.style.setProperty('display', 'none', 'important'); });
+      Array.prototype.forEach.call(row.querySelectorAll('[title], [aria-label], [data-original-title]'), function (el) {
+        var t = [el.getAttribute('title'), el.getAttribute('aria-label'), el.getAttribute('data-original-title')].join(' ');
+        if (/回复|回帖|repl/i.test(t) && !el.closest('a[href*="/topic/"]')) el.style.setProperty('display', 'none', 'important');
+      });
+    });
+  }
   function isCat7() {
     return document.body && document.body.classList.contains("page-category") && /\/category\/7(?:\/|$)/.test(location.pathname);
   }
@@ -2803,8 +2914,9 @@
     list.forEach(function (x) { map[String(x.tid)] = Number(x.last_chat_at || 0); });
     rows.sort(function (a, b) { return (map[b.tid] || 0) - (map[a.tid] || 0); });
     rows.forEach(function (x) { if (x.parent && x.row) x.parent.appendChild(x.row); });
+    hideTopicReplyCounts();
   }
-  function boot() { setTimeout(sortByActivity, 450); }
+  function boot() { hideTopicReplyCounts(); setTimeout(hideTopicReplyCounts, 250); setTimeout(sortByActivity, 450); }
   if (window.jQuery) $(window).on("action:ajaxify.end", boot);
   document.addEventListener("DOMContentLoaded", boot);
   window.addEventListener("load", boot);
