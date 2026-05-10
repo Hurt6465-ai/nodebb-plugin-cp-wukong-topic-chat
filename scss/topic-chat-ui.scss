@@ -589,3 +589,89 @@ body.cp-topic-chat-on-v20 { overflow:hidden !important; }
   border-radius: 0 !important;
   box-shadow: none !important;
 }
+
+
+/* v27 perf-stable avatar overlays: do not clip country flag/online dot. */
+.cp-avatar-wrap,
+.cp-peer-avatar {
+  overflow: visible !important;
+}
+
+.cp-avatar-stack {
+  position: relative !important;
+  display: block !important;
+  width: 100% !important;
+  height: 100% !important;
+  border-radius: 50% !important;
+  overflow: visible !important;
+}
+
+.cp-avatar-stack > .avatar,
+.cp-avatar-stack > img,
+.cp-avatar-stack > .cp-avatar-fallback {
+  width: 100% !important;
+  height: 100% !important;
+  border-radius: 50% !important;
+  object-fit: cover !important;
+  overflow: hidden !important;
+}
+
+.cp-avatar-flag {
+  position: absolute !important;
+  left: -1px !important;
+  bottom: -2px !important;
+  z-index: 5 !important;
+  display: inline-block !important;
+  width: auto !important;
+  height: auto !important;
+  line-height: 1 !important;
+  font-size: 14px !important;
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+  pointer-events: none !important;
+}
+
+.cp-avatar-online {
+  position: absolute !important;
+  top: 1px !important;
+  right: 1px !important;
+  z-index: 6 !important;
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 999px !important;
+  background: #22c55e !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  pointer-events: none !important;
+}
+
+#cp-topic-avatar.cp-peer-avatar-hash {
+  width: auto !important;
+  height: auto !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  aspect-ratio: auto !important;
+  border-radius: 0 !important;
+  overflow: visible !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  color: #64748b !important;
+}
+
+#cp-topic-avatar.cp-peer-avatar-hash .cp-topic-hash-avatar {
+  display: inline-block !important;
+  font-size: 24px !important;
+  line-height: 1 !important;
+  font-weight: 900 !important;
+  color: inherit !important;
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
